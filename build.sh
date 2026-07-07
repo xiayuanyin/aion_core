@@ -1,0 +1,1 @@
+cargo install --path crates/aionui-app --locked --force

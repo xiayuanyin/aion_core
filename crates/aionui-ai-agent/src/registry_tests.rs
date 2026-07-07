@@ -52,7 +52,7 @@ fn probe_resolved_command_accepts_bare_npx_when_managed_runtime_is_supported() {
 }
 
 #[test]
-fn probe_resolved_command_requires_primary_binary_for_builtin_managed_claude() {
+fn probe_resolved_command_does_not_require_primary_binary_for_builtin_managed_claude() {
     if !probe_node_runtime_supported().is_supported()
         || !probe_managed_acp_tool_supported(ManagedAcpToolId::ClaudeAgentAcp).is_supported()
     {
@@ -99,15 +99,12 @@ fn probe_resolved_command_requires_primary_binary_for_builtin_managed_claude() {
         env_override_key_count: 0,
     };
 
-    let reason = probe_resolved_command(&meta).expect_err("missing claude CLI must hide builtin row");
-    assert!(matches!(
-        reason,
-        UnavailableReason::PrimaryMissing { binary } if binary == "definitely-missing-claude-cli"
-    ));
+    let resolved = probe_resolved_command(&meta).expect("startup catalog probe should not require claude CLI");
+    assert_eq!(resolved, PathBuf::from("claude-agent-acp"));
 }
 
 #[test]
-fn probe_resolved_command_requires_primary_binary_for_builtin_managed_codex() {
+fn probe_resolved_command_does_not_require_primary_binary_for_builtin_managed_codex() {
     if !probe_node_runtime_supported().is_supported()
         || !probe_managed_acp_tool_supported(ManagedAcpToolId::CodexAcp).is_supported()
     {
@@ -154,11 +151,8 @@ fn probe_resolved_command_requires_primary_binary_for_builtin_managed_codex() {
         env_override_key_count: 0,
     };
 
-    let reason = probe_resolved_command(&meta).expect_err("missing codex CLI must hide builtin row");
-    assert!(matches!(
-        reason,
-        UnavailableReason::PrimaryMissing { binary } if binary == "definitely-missing-codex-cli"
-    ));
+    let resolved = probe_resolved_command(&meta).expect("startup catalog probe should not require codex CLI");
+    assert_eq!(resolved, PathBuf::from("codex-acp"));
 }
 
 #[tokio::test]

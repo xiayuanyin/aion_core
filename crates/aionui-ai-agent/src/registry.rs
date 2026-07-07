@@ -928,11 +928,14 @@ impl std::fmt::Display for UnavailableReason {
 /// source of truth for `available` — callers never re-run `which()`
 /// themselves.
 ///
-/// Bridge-based rows (e.g. `bun x @pkg`) require both `bun` (the spawn
-/// command) and the wrapped CLI (`claude`, recorded in
-/// `agent_source_info.binary_name`) to be present. Direct-CLI rows
-/// have `spawn command == primary binary`, so the primary-binary check
-/// is a no-op for them.
+/// Managed builtin ACP rows (`codex-acp`, `claude-agent-acp`) only need
+/// AionCore-managed runtime/tool support at catalog initialization time.
+/// Manual Test Connection and real session startup remain responsible for
+/// surfacing upstream CLI auth/setup failures.
+///
+/// Non-managed bridge rows still require both the bridge command and the
+/// wrapped primary CLI to be present. Direct-CLI rows have `spawn command ==
+/// primary binary`, so the primary-binary check is a no-op for them.
 fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableReason> {
     if !meta.enabled {
         return Err(UnavailableReason::Disabled);
@@ -954,13 +957,6 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
             return Err(UnavailableReason::ManagedRuntimeUnavailable {
                 resource: tool.slug().to_owned(),
                 detail: tool_support.detail,
-            });
-        }
-        if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
-            && probe_command_candidate(primary).is_none()
-        {
-            return Err(UnavailableReason::PrimaryMissing {
-                binary: primary.to_owned(),
             });
         }
         return Ok(PathBuf::from(tool.slug()));
