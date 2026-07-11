@@ -107,7 +107,7 @@ pub struct AionrsBuildExtra {
 }
 
 fn default_aionrs_max_tokens() -> u32 {
-    8192
+    65536
 }
 
 /// ACP model information returned by the ACP backend.
