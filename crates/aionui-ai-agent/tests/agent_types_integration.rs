@@ -103,6 +103,7 @@ fn make_aionrs_config() -> AionrsResolvedConfig {
         session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
         session_mode: None,
         extra_mcp_servers: Default::default(),
+        runtime_env: Vec::new(),
         bedrock_config: None,
     }
 }

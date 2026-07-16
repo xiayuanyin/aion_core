@@ -17,6 +17,8 @@ use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
+use crate::factory::environment_context::append_environment_context;
+use crate::factory::injected_env::load_injected_envs;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
@@ -42,6 +44,10 @@ pub(super) async fn build(
             None => rules,
         });
     }
+    overrides.system_prompt = Some(append_environment_context(
+        overrides.system_prompt.take(),
+        &ctx.workspace,
+    ));
 
     let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
     if let Some(repo) = deps.mcp_server_repo.as_ref() {
@@ -103,6 +109,14 @@ pub(super) async fn build(
     };
 
     let session_directory = deps.data_dir.join("aionrs-sessions");
+    let runtime_env = match deps.client_pref_repo.as_ref() {
+        Some(repo) => load_injected_envs(repo.as_ref())
+            .await
+            .into_iter()
+            .map(|entry| (entry.name, entry.value))
+            .collect(),
+        None => Vec::new(),
+    };
 
     let resume_session = {
         let session_mgr = SessionManager::new(session_directory.clone(), 100);
@@ -166,6 +180,7 @@ pub(super) async fn build(
         session_directory,
         session_mode: overrides.session_mode,
         extra_mcp_servers,
+        runtime_env,
         bedrock_config,
     };
 
@@ -232,7 +247,7 @@ pub(crate) fn map_aionrs_provider(platform: &str, model_id: &str, model_protocol
 /// Resolve base_url and compat overrides for the aionrs provider.
 ///
 /// Mirrors the frontend `envBuilder.ts` logic:
-/// - Strips trailing `/v1` from base_url (aionrs appends its own path)
+/// - Strips trailing `/v1` and restores the legacy OpenAI-compatible API path
 /// - Gemini: prepends `/v1beta/openai` and overrides `api_path`
 /// - OpenAI official (`api.openai.com`): sets `max_completion_tokens`
 pub(crate) fn resolve_aionrs_url_and_compat(
@@ -259,8 +274,13 @@ pub(crate) fn resolve_aionrs_url_and_compat(
     let normalized = normalize_aionrs_base_url(raw_base_url);
     let base_url = Some(normalized).filter(|u| !u.is_empty());
 
-    if mapped_provider == "openai" && is_openai_host(raw_base_url) {
-        compat.max_tokens_field = Some("max_completion_tokens".to_owned());
+    if mapped_provider == "openai" {
+        // Aionrs v0.2 defaults to `/chat/completions`, while existing AionUi
+        // provider URLs rely on the previous `/v1/chat/completions` contract.
+        compat.api_path = Some("/v1/chat/completions".to_owned());
+        if is_openai_host(raw_base_url) {
+            compat.max_tokens_field = Some("max_completion_tokens".to_owned());
+        }
     }
 
     (base_url, compat)
@@ -862,7 +882,7 @@ mod tests {
         let (base_url, compat) = resolve_aionrs_url_and_compat("custom", "https://api.openai.com/v1", "openai", false);
         assert_eq!(base_url.as_deref(), Some("https://api.openai.com"));
         assert_eq!(compat.max_tokens_field.as_deref(), Some("max_completion_tokens"));
-        assert!(compat.api_path.is_none());
+        assert_eq!(compat.api_path.as_deref(), Some("/v1/chat/completions"));
     }
 
     #[test]
@@ -871,6 +891,7 @@ mod tests {
             resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/v1", "openai", false);
         assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com"));
         assert!(compat.max_tokens_field.is_none());
+        assert_eq!(compat.api_path.as_deref(), Some("/v1/chat/completions"));
     }
 
     #[test]
@@ -930,7 +951,7 @@ mod tests {
         let (base_url, compat) =
             resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/v1", "openai", false);
         assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com"));
-        assert!(compat.api_path.is_none());
+        assert_eq!(compat.api_path.as_deref(), Some("/v1/chat/completions"));
     }
 
     #[test]

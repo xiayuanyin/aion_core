@@ -84,6 +84,8 @@ impl AionrsAgentManager {
             profile: None,
             auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
             project_dir: Some(PathBuf::from(&workspace)),
+            thinking: None,
+            thinking_budget: None,
         };
 
         let mut config =
@@ -108,7 +110,7 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink);
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(config_extra.runtime_env.clone());
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,
@@ -492,8 +494,32 @@ mod tests {
             session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
             session_mode: None,
             extra_mcp_servers: std::collections::HashMap::new(),
+            runtime_env: Vec::new(),
             bedrock_config: None,
         }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn aionrs_exec_command_receives_runtime_env() {
+        let mut config = make_test_config();
+        config.runtime_env = vec![("AIONUI_TEST_INJECTED_ENV".into(), "injected-value".into())];
+        let agent = AionrsAgentManager::new("conv-env".into(), "/tmp".into(), config, None)
+            .await
+            .unwrap();
+        let mut engine = agent.engine.lock().await;
+        let tool = engine.registry_mut().get("ExecCommand").unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({"cmd": "printf '%s' \"$AIONUI_TEST_INJECTED_ENV\""}))
+            .await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert!(
+            result.content.contains("injected-value"),
+            "unexpected output: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

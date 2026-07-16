@@ -3,11 +3,13 @@ pub mod acp_assembler;
 mod acp;
 pub(crate) mod aionrs;
 mod context;
+mod environment_context;
+mod injected_env;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_db::{IMcpServerRepository, IProviderRepository};
+use aionui_db::{IClientPreferenceRepository, IMcpServerRepository, IProviderRepository};
 use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
 
@@ -39,6 +41,9 @@ pub struct AgentFactoryDeps {
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
+    /// Global and profile-provided environment variables loaded for each new
+    /// agent process. `None` for isolated factory tests.
+    pub client_pref_repo: Option<Arc<dyn IClientPreferenceRepository>>,
 }
 
 /// Build a production agent factory that dispatches to concrete agent types.

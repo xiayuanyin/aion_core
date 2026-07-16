@@ -5,6 +5,7 @@ use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
 use crate::factory::context::FactoryContext;
+use crate::factory::injected_env::apply_injected_envs;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
@@ -51,6 +52,9 @@ pub(super) async fn build(
 
     let mut command_spec =
         resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
+    if let Some(repo) = deps.client_pref_repo.as_ref() {
+        apply_injected_envs(repo.as_ref(), &mut command_spec.env).await;
+    }
     if meta.backend.as_deref() == Some("claude") {
         let cc_switch_env = crate::cc_switch::read_claude_provider_env();
         if !cc_switch_env.is_empty() {

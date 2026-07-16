@@ -119,6 +119,12 @@ async fn brand_new_first_prompt_injects_preset_context() {
     let out = pipeline.pre_send(&mut ctx, "hello".into()).await;
     assert!(out.contains("[Assistant Rules]"), "prelude block missing: {out}");
     assert!(out.contains("Rule A"), "preset_context missing: {out}");
+    assert!(out.contains("<operating_system>"), "operating system missing: {out}");
+    assert!(out.contains("<current_date>"), "current date missing: {out}");
+    assert!(
+        out.contains("<current_working_directory>/tmp</current_working_directory>"),
+        "current working directory missing: {out}"
+    );
     assert!(out.ends_with("hello"), "user content should be at the end: {out}");
 
     // Flag must have been consumed.

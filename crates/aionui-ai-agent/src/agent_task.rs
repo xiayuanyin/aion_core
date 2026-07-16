@@ -527,6 +527,7 @@ mod aionrs_config_option_tests {
             session_directory: std::env::temp_dir().join("aionrs-agent-task-test-sessions"),
             session_mode: None,
             extra_mcp_servers: std::collections::HashMap::new(),
+            runtime_env: Vec::new(),
             bedrock_config: None,
         }
     }

@@ -12,11 +12,11 @@ use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
-    Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    Database, IAcpSessionRepository, IAgentMetadataRepository, IClientPreferenceRepository, IConversationRepository,
+    IMcpServerRepository, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
-    SqliteUserRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository,
+    SqliteProviderRepository, SqliteSkillRepository, SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
@@ -112,6 +112,8 @@ impl AppServices {
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
             Arc::new(SqliteMcpServerRepository::new(database.pool().clone()));
+        let client_pref_repo: Arc<dyn IClientPreferenceRepository> =
+            Arc::new(SqliteClientPreferenceRepository::new(database.pool().clone()));
 
         let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
             Arc::new(SqliteAgentMetadataRepository::new(database.pool().clone()));
@@ -159,6 +161,7 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            client_pref_repo: Some(client_pref_repo),
         });
 
         // Agent factory is now wired. Future extension/custom agents

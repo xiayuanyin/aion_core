@@ -1,3 +1,4 @@
+use crate::factory::environment_context::append_environment_context;
 use crate::shared_kernel::PersistedSessionState;
 use agent_client_protocol::schema::{EnvVariable, McpServer, McpServerStdio, NewSessionRequest};
 use aionui_api_types::AgentMetadata;
@@ -70,7 +71,10 @@ pub async fn assemble_acp_params(
     dump_prompts: bool,
 ) -> AcpSessionParams {
     let mcp_servers = resolve_mcp_servers(&config, user_mcp_servers);
-    let preset_context = compose_preset_context(config.preset_context.as_deref());
+    let preset_context = Some(append_environment_context(
+        compose_preset_context(config.preset_context.as_deref()),
+        &workspace.path,
+    ));
 
     AcpSessionParams {
         conversation_id,
@@ -216,7 +220,9 @@ mod tests {
         .await;
 
         assert!(params.dump_prompts);
-        assert_eq!(params.preset_context.as_deref(), Some("frozen rules"));
+        let preset_context = params.preset_context.as_deref().expect("preset context");
+        assert!(preset_context.starts_with("frozen rules\n\n<environment_context>"));
+        assert!(preset_context.contains("<current_working_directory>/tmp/workspace</current_working_directory>"));
         assert_eq!(params.config.skills, vec!["pdf"]);
         assert_eq!(
             params.config.mcp_server_ids.as_deref(),

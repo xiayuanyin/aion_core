@@ -88,6 +88,7 @@ impl ProviderHealthCheckService {
             session_directory: self.data_dir.join("aionrs-health-check-sessions"),
             session_mode: None,
             extra_mcp_servers: HashMap::new(),
+            runtime_env: Vec::new(),
             bedrock_config,
         })
     }
@@ -202,6 +203,8 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
         profile: None,
         auto_approve: false,
         project_dir: Some(PathBuf::from(&workspace)),
+        thinking: None,
+        thinking_budget: None,
     };
     let mut config =
         Config::resolve(&cli_args).map_err(|error| AgentError::internal(format!("Config resolve failed: {error}")))?;
