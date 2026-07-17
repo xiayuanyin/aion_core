@@ -119,6 +119,9 @@ async fn au2_unauthenticated_all_endpoints() {
         ("GET", "/api/cron/jobs/cron_test"),
         ("GET", "/api/cron/jobs/cron_test/skill"),
         ("DELETE", "/api/cron/jobs/cron_test/skill"),
+        ("GET", "/api/internal/conversation-cron/list"),
+        ("POST", "/api/internal/conversation-cron/create"),
+        ("PUT", "/api/internal/conversation-cron/jobs/cron_test"),
     ];
 
     for (method, uri) in endpoints {
@@ -134,6 +137,14 @@ async fn au2_unauthenticated_all_endpoints() {
             resp.status()
         );
     }
+}
+
+#[test]
+fn cron_skill_is_not_bundled() {
+    let skill =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/builtin-skills/auto-inject/cron/SKILL.md");
+
+    assert!(!skill.exists());
 }
 
 // ── CJ-1: Create cron job ───────────────────────────────────────────
@@ -376,6 +387,7 @@ async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         })
         .await
         .unwrap();
@@ -605,7 +617,7 @@ async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
 }
 
 #[tokio::test]
-async fn rn1b_run_now_returns_conflict_when_conversation_is_busy() {
+async fn rn1b_run_now_returns_active_conversation_when_conversation_is_busy() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
@@ -643,14 +655,10 @@ async fn rn1b_run_now_returns_conflict_when_conversation_is_busy() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let body = body_json(resp).await;
-    assert_eq!(body["code"], "CONFLICT");
-    assert!(
-        body["error"].as_str().unwrap_or_default().contains("already running"),
-        "busy run-now should surface conversation busy semantics"
-    );
+    assert_eq!(body["data"]["conversation_id"], json!(conversation_id));
 
     drop(claim);
 }

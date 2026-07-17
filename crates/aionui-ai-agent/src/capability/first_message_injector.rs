@@ -54,6 +54,7 @@ pub async fn inject_first_message_prefix(
 mod tests {
     use super::*;
     use aionui_extension::{BUILTIN_SKILLS_ENV_VAR, resolve_skill_paths};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
 
     fn test_mgr(base: &std::path::Path) -> Arc<AcpSkillManager> {
@@ -63,13 +64,22 @@ mod tests {
 
     /// Point the embedded corpus at an empty dir so tests don't pick up
     /// real auto-inject builtin skills.
-    struct EmptyBuiltinGuard;
+    fn builtin_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EmptyBuiltinGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
     impl EmptyBuiltinGuard {
         fn new(empty_path: &std::path::Path) -> Self {
+            let lock = builtin_env_lock().lock().unwrap_or_else(|error| error.into_inner());
             unsafe {
                 std::env::set_var(BUILTIN_SKILLS_ENV_VAR, empty_path);
             }
-            Self
+            Self { _lock: lock }
         }
     }
     impl Drop for EmptyBuiltinGuard {

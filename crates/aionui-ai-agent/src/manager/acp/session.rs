@@ -381,7 +381,17 @@ impl AcpSession {
             .push(PendingStartupConfigSeed { category, value });
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_pending_startup_config_seeds(&mut self) -> Vec<PendingStartupConfigSeedResult> {
+        self.resolve_pending_startup_config_seeds_with_mode_normalizer(|requested, _available_values| {
+            requested.to_owned()
+        })
+    }
+
+    pub(crate) fn resolve_pending_startup_config_seeds_with_mode_normalizer(
+        &mut self,
+        mode_normalizer: impl Fn(&str, Vec<&str>) -> String,
+    ) -> Vec<PendingStartupConfigSeedResult> {
         let seeds = std::mem::take(&mut self.desired.pending_startup_config);
         if seeds.is_empty() {
             return Vec::new();
@@ -405,7 +415,13 @@ impl AcpSession {
                 continue;
             };
 
-            if !select_option_contains_value(&option.kind, seed.value.as_str()) {
+            let resolved_value = if seed.category == SessionConfigOptionCategory::Mode {
+                ConfigValue::new(mode_normalizer(seed.value.as_str(), select_option_values(&option.kind)))
+            } else {
+                seed.value.clone()
+            };
+
+            if !select_option_contains_value(&option.kind, resolved_value.as_str()) {
                 self.handle_unresolved_startup_config_seed(&seed, true);
                 results.push(PendingStartupConfigSeedResult::ValueNotSelectable {
                     category: seed.category,
@@ -415,7 +431,7 @@ impl AcpSession {
 
             let option_id = ConfigKey::new(option.id.to_string());
             self.clear_legacy_desired_for_config_category(&seed.category);
-            self.set_desired_config(option_id.clone(), seed.value);
+            self.set_desired_config(option_id.clone(), resolved_value);
             results.push(PendingStartupConfigSeedResult::Applied {
                 category: seed.category,
                 option_id,
@@ -595,8 +611,26 @@ impl AcpSession {
     }
 
     pub fn apply_advertised_modes(&mut self, modes: SessionModeState) {
+        let incoming_mode_catalog_count = modes.available_modes.len();
+        let existing_mode_catalog_count = self
+            .advertised
+            .modes
+            .as_ref()
+            .map_or(0, |modes| modes.available_modes.len());
+        let modes = self.preserve_existing_mode_catalog_if_empty(modes);
+        let final_mode_catalog_count = modes.available_modes.len();
         let new_id = ModeId::new(modes.current_mode_id.to_string());
         let changed = self.observed.mode_id.as_ref() != Some(&new_id);
+        if incoming_mode_catalog_count == 0
+            && existing_mode_catalog_count > 0
+            && final_mode_catalog_count == existing_mode_catalog_count
+        {
+            tracing::debug!(
+                current_mode = %new_id,
+                preserved_mode_catalog_count = final_mode_catalog_count,
+                "ACP advertised modes kept existing catalog for empty runtime update"
+            );
+        }
         self.observed.mode_id = Some(new_id.clone());
         self.advertised.modes = Some(modes);
         if changed {
@@ -606,14 +640,52 @@ impl AcpSession {
     }
 
     pub fn apply_advertised_models(&mut self, models: SessionModelState) {
+        let incoming_model_catalog_count = models.available_models.len();
+        let existing_model_catalog_count = self
+            .advertised
+            .models
+            .as_ref()
+            .map_or(0, |models| models.available_models.len());
+        let models = self.preserve_existing_model_catalog_if_empty(models);
+        let final_model_catalog_count = models.available_models.len();
         let new_id = ModelId::new(models.current_model_id.to_string());
         let changed = self.observed.model_id.as_ref() != Some(&new_id);
+        if incoming_model_catalog_count == 0
+            && existing_model_catalog_count > 0
+            && final_model_catalog_count == existing_model_catalog_count
+        {
+            tracing::debug!(
+                current_model = %new_id,
+                preserved_model_catalog_count = final_model_catalog_count,
+                "ACP advertised models kept existing catalog for empty runtime update"
+            );
+        }
         self.observed.model_id = Some(new_id.clone());
         self.advertised.models = Some(models);
         if changed {
             self.pending_events
                 .push(AcpSessionEvent::ObservedModelSynced { model: new_id });
         }
+    }
+
+    fn preserve_existing_mode_catalog_if_empty(&self, mut modes: SessionModeState) -> SessionModeState {
+        if modes.available_modes.is_empty()
+            && let Some(existing) = self.advertised.modes.as_ref()
+            && !existing.available_modes.is_empty()
+        {
+            modes.available_modes.clone_from(&existing.available_modes);
+        }
+        modes
+    }
+
+    fn preserve_existing_model_catalog_if_empty(&self, mut models: SessionModelState) -> SessionModelState {
+        if models.available_models.is_empty()
+            && let Some(existing) = self.advertised.models.as_ref()
+            && !existing.available_models.is_empty()
+        {
+            models.available_models.clone_from(&existing.available_models);
+        }
+        models
     }
 
     fn preserve_desired_model_in_catalog(&self, models: SessionModelState) -> SessionModelState {
@@ -717,11 +789,23 @@ impl AcpSession {
     /// Called on resume paths before the CLI session/load response arrives.
     pub fn preload_persisted(&mut self, state: &PersistedSessionState) {
         if let Some(mode) = &state.current_mode_id {
-            self.advertised.modes = Some(SessionModeState::new(mode.as_str().to_owned(), Vec::new()));
+            let available_modes = self
+                .advertised
+                .modes
+                .as_ref()
+                .map(|modes| modes.available_modes.clone())
+                .unwrap_or_default();
+            self.advertised.modes = Some(SessionModeState::new(mode.as_str().to_owned(), available_modes));
             self.observed.mode_id = Some(mode.clone());
         }
         if let Some(model) = &state.current_model_id {
-            self.advertised.models = Some(SessionModelState::new(model.as_str().to_owned(), Vec::new()));
+            let available_models = self
+                .advertised
+                .models
+                .as_ref()
+                .map(|models| models.available_models.clone())
+                .unwrap_or_default();
+            self.advertised.models = Some(SessionModelState::new(model.as_str().to_owned(), available_models));
             self.observed.model_id = Some(model.clone());
         }
         if !state.config_selections.is_empty() {
@@ -918,6 +1002,23 @@ fn select_option_contains_value(kind: &SessionConfigKind, value: &str) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+fn select_option_values(kind: &SessionConfigKind) -> Vec<&str> {
+    match kind {
+        SessionConfigKind::Select(select) => match &select.options {
+            SessionConfigSelectOptions::Ungrouped(options) => {
+                options.iter().map(|option| option.value.0.as_ref()).collect()
+            }
+            SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .map(|option| option.value.0.as_ref())
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 

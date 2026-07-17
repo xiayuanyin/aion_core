@@ -58,6 +58,16 @@ pub struct BuiltinAssistant {
     pub prompts_i18n: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Default position in the official assistant list. Lower comes first.
+    /// Owned by this manifest (users cannot reorder official assistants), so
+    /// this value is authoritative across versions. Defaults to 0.
+    #[serde(default)]
+    pub sort_order: i32,
+    /// Whether this official assistant is enabled by default when a user has
+    /// no overlay for it. Only the butler ships enabled; others default off so
+    /// they don't crowd the user's selection lists. Defaults to false.
+    #[serde(default)]
+    pub default_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,8 +304,8 @@ mod tests {
     fn load_embedded_rule_bytes_available_for_shipped_preset() {
         let reg = BuiltinAssistantRegistry::load_embedded();
         let bytes = reg
-            .rule_bytes("word-creator", "en-US")
-            .expect("shipped word-creator en-US rule should resolve from the embedded bundle");
+            .rule_bytes("cowork", "zh-CN")
+            .expect("shipped cowork zh-CN rule should resolve from the embedded bundle");
         assert!(!bytes.is_empty());
         let text = std::str::from_utf8(&bytes).expect("rule file should be valid utf-8");
         assert!(text.len() > 100, "rule file should have real content");

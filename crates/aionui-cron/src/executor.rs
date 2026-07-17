@@ -44,6 +44,11 @@ pub(crate) struct PreparedExecution {
     saved_skill: Option<SavedSkillContext>,
 }
 
+pub(crate) enum PreparedRunNow {
+    Ready(PreparedExecution),
+    AlreadyRunning { conversation_id: String },
+}
+
 struct SkillSuggestContext {
     conversation_id: String,
     job_id: String,
@@ -85,41 +90,70 @@ impl JobExecutor {
     }
 
     pub async fn execute(&self, job: &CronJob) -> ExecutionResult {
+        let prepared = match self.prepare_scheduled(job).await {
+            Ok(prepared) => prepared,
+            Err(result) => return result,
+        };
+
+        self.execute_prepared_scheduled(job, prepared).await
+    }
+
+    pub(crate) async fn prepare_scheduled(&self, job: &CronJob) -> Result<PreparedExecution, ExecutionResult> {
         let saved_skill = match self.prepare_saved_skill(job).await {
             Ok(skill) => skill,
             Err(e) => {
                 error!(job_id = %job.id, error = %e, "Failed to prepare saved cron skill");
-                return ExecutionResult::Error { message: e.to_string() };
+                return Err(ExecutionResult::Error { message: e.to_string() });
             }
         };
 
         if let Err(e) = self.validate_runtime_job_workspace(job).await {
             error!(job_id = %job.id, error = %e, "Failed cron workspace validation");
-            return ExecutionResult::Error { message: e.to_string() };
+            return Err(ExecutionResult::Error { message: e.to_string() });
         }
 
-        let target_conversation_id = match self.resolve_conversation(job, saved_skill.as_ref()).await {
+        if job.queue_enabled && job.execution_mode == ExecutionMode::NewConversation {
+            match self.find_active_cron_conversation(job).await {
+                Ok(Some(conversation_id)) => {
+                    info!(
+                        job_id = %job.id,
+                        conversation_id,
+                        "Cron queue is enabled and a previous execution is still active; skipping trigger"
+                    );
+                    return Err(ExecutionResult::Skipped);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!(job_id = %job.id, error = %e, "Failed to inspect previous cron executions");
+                    return Err(ExecutionResult::Error { message: e.to_string() });
+                }
+            }
+        }
+
+        let conversation_id = match self.resolve_conversation(job, saved_skill.as_ref()).await {
             Ok(id) => id,
             Err(e) => {
                 error!(job_id = %job.id, error = %e, "Failed to resolve conversation");
-                return ExecutionResult::Error { message: e.to_string() };
+                return Err(ExecutionResult::Error { message: e.to_string() });
             }
         };
 
-        if self.is_conversation_claimed(&target_conversation_id) {
+        if self.is_conversation_claimed(&conversation_id) {
             info!(
                 job_id = %job.id,
-                conversation_id = %target_conversation_id,
+                conversation_id = %conversation_id,
                 "Cron target conversation already has an active turn; scheduling retry"
             );
-            return self.handle_busy(job);
+            return Err(self.handle_busy(job));
         }
 
-        self.execute_inner(job, &target_conversation_id, saved_skill.as_ref())
-            .await
+        Ok(PreparedExecution {
+            conversation_id,
+            saved_skill,
+        })
     }
 
-    pub(crate) async fn prepare_run_now(&self, job: &CronJob) -> Result<PreparedExecution, CronError> {
+    pub(crate) async fn prepare_run_now(&self, job: &CronJob) -> Result<PreparedRunNow, CronError> {
         let saved_skill = match self.prepare_saved_skill(job).await {
             Ok(skill) => skill,
             Err(err) => {
@@ -139,21 +173,39 @@ impl JobExecutor {
             info!(
                 job_id = %job.id,
                 conversation_id = %conversation_id,
-                "Run-now rejected because target conversation already has an active turn"
+                "Run-now target conversation already has an active turn; returning it for navigation"
             );
-            return Err(CronError::Conversation(ConversationError::Busy {
-                reason: format!("conversation {conversation_id} is already running"),
-            }));
+            return Ok(PreparedRunNow::AlreadyRunning { conversation_id });
         }
 
-        Ok(PreparedExecution {
+        Ok(PreparedRunNow::Ready(PreparedExecution {
             conversation_id,
             saved_skill,
-        })
+        }))
     }
 
     pub(crate) async fn execute_prepared(&self, job: &CronJob, prepared: PreparedExecution) -> ExecutionResult {
         self.execute_inner_with_busy_retry(job, &prepared.conversation_id, prepared.saved_skill.as_ref(), false)
+            .await
+    }
+
+    pub(crate) async fn execute_prepared_scheduled(
+        &self,
+        job: &CronJob,
+        prepared: PreparedExecution,
+    ) -> ExecutionResult {
+        self.execute_inner_with_busy_retry(job, &prepared.conversation_id, prepared.saved_skill.as_ref(), true)
+            .await
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn execute_inner(
+        &self,
+        job: &CronJob,
+        conversation_id: &str,
+        saved_skill: Option<&SavedSkillContext>,
+    ) -> ExecutionResult {
+        self.execute_inner_with_busy_retry(job, conversation_id, saved_skill, true)
             .await
     }
 
@@ -178,6 +230,18 @@ impl JobExecutor {
             .get(conversation_id)
             .await
             .map_err(CronError::Database)
+    }
+
+    pub async fn auto_workspace_to_delete_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<PathBuf>, CronError> {
+        let Some(row) = self.get_conversation_row(conversation_id).await? else {
+            return Ok(None);
+        };
+        Ok(self
+            .conversation_service
+            .auto_workspace_to_delete_for_row(&row, conversation_id))
     }
 
     pub async fn get_assistant_snapshot(
@@ -244,6 +308,64 @@ impl JobExecutor {
         &self,
         conversation_id: &str,
         cron_job_id: &str,
+        session_mode: Option<&str>,
+    ) -> Result<(), CronError> {
+        let Some(row) = self.get_conversation_row(conversation_id).await? else {
+            return Ok(());
+        };
+
+        let session_mode = session_mode.map(str::trim).filter(|value| !value.is_empty());
+        let is_acp_conversation = row.r#type == AgentType::Acp.serde_name();
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        if !extra.is_object() {
+            extra = serde_json::json!({});
+        }
+
+        let obj = extra.as_object_mut().expect("json object");
+        let mut changed = false;
+
+        let current = obj
+            .get("cron_job_id")
+            .and_then(|value| value.as_str())
+            .or_else(|| obj.get("cronJobId").and_then(|value| value.as_str()));
+
+        if current != Some(cron_job_id) {
+            obj.insert(
+                "cron_job_id".to_owned(),
+                serde_json::Value::String(cron_job_id.to_owned()),
+            );
+            obj.insert(
+                "cronJobId".to_owned(),
+                serde_json::Value::String(cron_job_id.to_owned()),
+            );
+            changed = true;
+        }
+
+        if changed {
+            let update = ConversationRowUpdate {
+                extra: Some(extra.to_string()),
+                updated_at: Some(now_ms()),
+                ..Default::default()
+            };
+            self.conversation_repo
+                .update(conversation_id, &update)
+                .await
+                .map_err(CronError::Database)?;
+        }
+
+        if is_acp_conversation && let Some(mode) = session_mode {
+            self.conversation_service
+                .save_acp_runtime_mode(conversation_id, mode)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn unbind_cron_job_from_conversation(
+        &self,
+        conversation_id: &str,
+        cron_job_id: &str,
     ) -> Result<(), CronError> {
         let Some(row) = self.get_conversation_row(conversation_id).await? else {
             return Ok(());
@@ -251,44 +373,21 @@ impl JobExecutor {
 
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
         let Some(obj) = extra.as_object_mut() else {
-            extra = serde_json::json!({});
-            extra.as_object_mut().expect("json object").insert(
-                "cron_job_id".to_owned(),
-                serde_json::Value::String(cron_job_id.to_owned()),
-            );
-            extra.as_object_mut().expect("json object").insert(
-                "cronJobId".to_owned(),
-                serde_json::Value::String(cron_job_id.to_owned()),
-            );
-            let update = ConversationRowUpdate {
-                extra: Some(extra.to_string()),
-                updated_at: Some(now_ms()),
-                ..Default::default()
-            };
-            return self
-                .conversation_repo
-                .update(conversation_id, &update)
-                .await
-                .map_err(CronError::Database);
+            return Ok(());
         };
 
-        let current = obj
-            .get("cron_job_id")
-            .and_then(|value| value.as_str())
-            .or_else(|| obj.get("cronJobId").and_then(|value| value.as_str()));
-
-        if current == Some(cron_job_id) {
+        let snake_matches = obj.get("cron_job_id").and_then(|value| value.as_str()) == Some(cron_job_id);
+        let camel_matches = obj.get("cronJobId").and_then(|value| value.as_str()) == Some(cron_job_id);
+        if !snake_matches && !camel_matches {
             return Ok(());
         }
 
-        obj.insert(
-            "cron_job_id".to_owned(),
-            serde_json::Value::String(cron_job_id.to_owned()),
-        );
-        obj.insert(
-            "cronJobId".to_owned(),
-            serde_json::Value::String(cron_job_id.to_owned()),
-        );
+        if snake_matches {
+            obj.remove("cron_job_id");
+        }
+        if camel_matches {
+            obj.remove("cronJobId");
+        }
 
         let update = ConversationRowUpdate {
             extra: Some(extra.to_string()),
@@ -363,6 +462,11 @@ impl JobExecutor {
 
 impl JobExecutor {
     fn handle_busy(&self, job: &CronJob) -> ExecutionResult {
+        if job.queue_enabled {
+            info!(job_id = %job.id, "Cron queue is enabled; skipping overlapping execution");
+            return ExecutionResult::Skipped;
+        }
+
         let max_retries = job.max_retries;
         let current_retry = job.retry_count;
 
@@ -394,39 +498,55 @@ impl JobExecutor {
             ExecutionMode::Existing => {
                 // A job created without an anchor conversation (the frontend
                 // creates "continue-this-conversation" jobs from the cron page
-                // before any conversation exists) keeps `conversation_id`
-                // empty until the first run. Treat that first run as a new
-                // conversation; the service layer then persists the new id
-                // back onto the job so subsequent runs reuse it.
-                if job.conversation_id.trim().is_empty() {
-                    return self.create_new_conversation(job, saved_skill).await;
+                // before any conversation exists), or whose anchor was later
+                // deleted, materializes a replacement conversation on demand.
+                // The service layer then persists the new id back onto the job
+                // so subsequent runs reuse it.
+                let conversation_id = job.conversation_id.trim();
+                if conversation_id.is_empty() {
+                    return self
+                        .create_new_conversation(job, saved_skill, ConversationPurpose::ExistingReplacement)
+                        .await;
                 }
-                self.verify_conversation_exists(&job.conversation_id).await?;
+                if !self.conversation_exists(conversation_id).await? {
+                    warn!(
+                        job_id = %job.id,
+                        conversation_id,
+                        "Cron existing-mode conversation is missing; creating a replacement conversation"
+                    );
+                    return self
+                        .create_new_conversation(job, saved_skill, ConversationPurpose::ExistingReplacement)
+                        .await;
+                }
                 Ok(job.conversation_id.clone())
             }
-            ExecutionMode::NewConversation => self.create_new_conversation(job, saved_skill).await,
+            ExecutionMode::NewConversation => {
+                self.create_new_conversation(job, saved_skill, ConversationPurpose::NewConversationExecution)
+                    .await
+            }
         }
     }
 
-    async fn verify_conversation_exists(&self, conversation_id: &str) -> Result<(), CronError> {
-        if !self.conversation_exists(conversation_id).await? {
-            return Err(CronError::Scheduler(format!(
-                "conversation {conversation_id} not found"
-            )));
-        }
-        Ok(())
+    async fn find_active_cron_conversation(&self, job: &CronJob) -> Result<Option<String>, CronError> {
+        let user_id = self.resolve_conversation_owner_user_id(job).await?;
+        let conversations = self.conversation_repo.list_by_cron_job(&user_id, &job.id).await?;
+        Ok(conversations
+            .into_iter()
+            .find(|conversation| self.is_conversation_claimed(&conversation.id))
+            .map(|conversation| conversation.id))
     }
 
     async fn create_new_conversation(
         &self,
         job: &CronJob,
         saved_skill: Option<&SavedSkillContext>,
+        purpose: ConversationPurpose,
     ) -> Result<String, CronError> {
         let agent_type = parse_agent_type(&self.agent_registry, &job.agent_type).await?;
         let model = resolve_model(job);
         let user_id = self.resolve_conversation_owner_user_id(job).await?;
 
-        let extra = build_conversation_extra(&self.agent_registry, job, saved_skill).await;
+        let extra = build_conversation_extra(&self.agent_registry, job, saved_skill, purpose).await;
         let assistant = build_assistant_request(job);
 
         let req = CreateConversationRequest {
@@ -482,16 +602,6 @@ impl JobExecutor {
         }
 
         Ok(SYSTEM_DEFAULT_USER_ID.to_owned())
-    }
-
-    async fn execute_inner(
-        &self,
-        job: &CronJob,
-        conversation_id: &str,
-        saved_skill: Option<&SavedSkillContext>,
-    ) -> ExecutionResult {
-        self.execute_inner_with_busy_retry(job, conversation_id, saved_skill, true)
-            .await
     }
 
     async fn execute_inner_with_busy_retry(
@@ -583,6 +693,7 @@ impl JobExecutor {
             content: prompt,
             files: vec![],
             inject_skills: skill_names.clone(),
+            required_runtime_mode: cron_job_runtime_mode(job).map(ToOwned::to_owned),
             persist_user_message: true,
             user_message_hidden: true,
             on_started,
@@ -948,6 +1059,14 @@ fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> Strin
     }
 }
 
+fn cron_job_runtime_mode(job: &CronJob) -> Option<&str> {
+    job.agent_config
+        .as_ref()
+        .and_then(|config| config.mode.as_deref())
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+}
+
 fn build_assistant_request(job: &CronJob) -> Option<AssistantConversationRequest> {
     let config = job.agent_config.as_ref()?;
     let assistant_id = config
@@ -976,19 +1095,28 @@ struct SavedSkillContext {
     raw_content: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationPurpose {
+    NewConversationExecution,
+    ExistingReplacement,
+}
+
 async fn build_conversation_extra(
     registry: &AgentRegistry,
     job: &CronJob,
     saved_skill: Option<&SavedSkillContext>,
+    purpose: ConversationPurpose,
 ) -> serde_json::Value {
     let assistant_backed = build_assistant_request(job).is_some();
     let mut extra = serde_json::Map::new();
     extra.insert("cron_job_id".to_owned(), serde_json::Value::String(job.id.clone()));
     extra.insert("cronJobId".to_owned(), serde_json::Value::String(job.id.clone()));
-    extra.insert(
-        "exclude_auto_inject_skills".to_owned(),
-        serde_json::Value::Array(vec![serde_json::Value::String("cron".to_owned())]),
-    );
+    if matches!(purpose, ConversationPurpose::NewConversationExecution) {
+        extra.insert(
+            "exclude_auto_inject_skills".to_owned(),
+            serde_json::Value::Array(vec![serde_json::Value::String("cron".to_owned())]),
+        );
+    }
 
     if let Some(saved_skill) = saved_skill {
         extra.insert(
@@ -1147,6 +1275,7 @@ mod tests {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         }
     }
 
@@ -1172,6 +1301,7 @@ mod tests {
         let job = CronJob {
             retry_count: 1,
             max_retries: 3,
+            queue_enabled: false,
             ..sample_job()
         };
         let result = executor.handle_busy(&job);
@@ -1185,6 +1315,7 @@ mod tests {
         let job = CronJob {
             retry_count: 3,
             max_retries: 3,
+            queue_enabled: false,
             ..sample_job()
         };
         let result = executor.handle_busy(&job);
@@ -1198,6 +1329,7 @@ mod tests {
         let job = CronJob {
             retry_count: 5,
             max_retries: 3,
+            queue_enabled: false,
             ..sample_job()
         };
         let result = executor.handle_busy(&job);
@@ -1211,10 +1343,24 @@ mod tests {
         let job = CronJob {
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
             ..sample_job()
         };
         let result = executor.handle_busy(&job);
         assert_eq!(result, ExecutionResult::Retrying { attempt: 1 });
+    }
+
+    #[tokio::test]
+    async fn handle_busy_returns_skipped_when_queue_is_enabled() {
+        let executor = make_executor_for_busy_tests();
+        let job = CronJob {
+            retry_count: 0,
+            max_retries: 3,
+            queue_enabled: true,
+            ..sample_job()
+        };
+
+        assert_eq!(executor.handle_busy(&job), ExecutionResult::Skipped);
     }
 
     #[tokio::test]
@@ -1237,7 +1383,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_run_now_returns_busy_error_when_runtime_state_is_already_claimed() {
+    async fn execute_returns_skipped_when_queue_is_enabled_and_conversation_is_claimed() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
+        let job = CronJob {
+            queue_enabled: true,
+            ..sample_job()
+        };
+        let claim = executor
+            .conversation_service
+            .runtime_state()
+            .try_claim_turn(&job.conversation_id, "turn-existing")
+            .expect("runtime claim should succeed");
+
+        let result = executor.execute(&job).await;
+
+        assert_eq!(result, ExecutionResult::Skipped);
+        assert_eq!(agent.send_calls(), 0, "queue protection should avoid send attempts");
+        drop(claim);
+    }
+
+    #[tokio::test]
+    async fn prepare_run_now_returns_active_conversation_when_runtime_state_is_already_claimed() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent));
         let job = sample_job();
@@ -1247,15 +1414,15 @@ mod tests {
             .try_claim_turn(&job.conversation_id, "turn-existing")
             .expect("runtime claim should succeed");
 
-        let err = executor
+        let prepared = executor
             .prepare_run_now(&job)
             .await
-            .expect_err("run-now should reject a claimed conversation");
+            .expect("run-now should return the claimed conversation");
 
         assert!(matches!(
-            err,
-            CronError::Conversation(ConversationError::Busy { reason })
-                if reason == format!("conversation {} is already running", job.conversation_id)
+            prepared,
+            PreparedRunNow::AlreadyRunning { conversation_id }
+                if conversation_id == job.conversation_id
         ));
 
         drop(claim);
@@ -1561,10 +1728,26 @@ mod tests {
             ..sample_job()
         };
 
-        let extra = build_conversation_extra(&registry, &job, None).await;
+        let extra =
+            build_conversation_extra(&registry, &job, None, ConversationPurpose::NewConversationExecution).await;
 
         assert_eq!(extra["cron_job_id"], "cron_test1");
         assert_eq!(extra["exclude_auto_inject_skills"], serde_json::json!(["cron"]));
+        assert!(extra.get("preset_enabled_skills").is_none());
+    }
+
+    #[tokio::test]
+    async fn build_conversation_extra_for_existing_replacement_keeps_cron_auto_inject() {
+        let registry = hydrated_registry().await;
+        let job = CronJob {
+            execution_mode: ExecutionMode::Existing,
+            ..sample_job()
+        };
+
+        let extra = build_conversation_extra(&registry, &job, None, ConversationPurpose::ExistingReplacement).await;
+
+        assert_eq!(extra["cron_job_id"], "cron_test1");
+        assert!(extra.get("exclude_auto_inject_skills").is_none());
         assert!(extra.get("preset_enabled_skills").is_none());
     }
 
@@ -1580,7 +1763,13 @@ mod tests {
             raw_content: "---\nname: test\ndescription: desc\n---\nDo X".into(),
         };
 
-        let extra = build_conversation_extra(&registry, &job, Some(&saved_skill)).await;
+        let extra = build_conversation_extra(
+            &registry,
+            &job,
+            Some(&saved_skill),
+            ConversationPurpose::NewConversationExecution,
+        )
+        .await;
 
         assert_eq!(extra["exclude_auto_inject_skills"], serde_json::json!(["cron"]));
         assert_eq!(extra["preset_enabled_skills"], serde_json::json!(["cron-cron_test1"]));
@@ -1596,7 +1785,8 @@ mod tests {
         config.is_preset = Some(true);
         config.custom_agent_id = None;
 
-        let extra = build_conversation_extra(&registry, &job, None).await;
+        let extra =
+            build_conversation_extra(&registry, &job, None, ConversationPurpose::NewConversationExecution).await;
 
         assert!(extra.get("assistant_id").is_none());
         assert!(extra.get("preset_assistant_id").is_none());
@@ -1628,7 +1818,8 @@ mod tests {
             ..sample_job()
         };
 
-        let extra = build_conversation_extra(&registry, &job, None).await;
+        let extra =
+            build_conversation_extra(&registry, &job, None, ConversationPurpose::NewConversationExecution).await;
 
         assert_eq!(
             extra["workspace"],
@@ -1646,7 +1837,8 @@ mod tests {
             ..sample_job()
         };
 
-        let extra = build_conversation_extra(&registry, &job, None).await;
+        let extra =
+            build_conversation_extra(&registry, &job, None, ConversationPurpose::NewConversationExecution).await;
 
         assert_eq!(extra["backend"], "claude");
     }
@@ -1675,7 +1867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_inner_leaves_session_mode_to_conversation_runtime() {
+    async fn execute_inner_applies_session_mode_to_active_conversation_runtime() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
         let mut job = sample_job();
@@ -1690,13 +1882,13 @@ mod tests {
             }
         );
         wait_for_agent_send(&agent, 1).await;
-        assert_eq!(agent.mode().await, "default");
-        assert_eq!(agent.set_mode_calls(), 0);
+        assert_eq!(agent.mode().await, "yolo");
+        assert_eq!(agent.set_mode_calls(), 1);
         assert_eq!(agent.send_calls(), 1);
     }
 
     #[tokio::test]
-    async fn execute_inner_does_not_directly_set_mode_for_uninitialized_agent() {
+    async fn execute_inner_applies_session_mode_when_mode_endpoint_is_uninitialized() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "default", false));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
         let mut job = sample_job();
@@ -1711,13 +1903,13 @@ mod tests {
             }
         );
         wait_for_agent_send(&agent, 1).await;
-        assert_eq!(agent.mode().await, "default");
-        assert_eq!(agent.set_mode_calls(), 0);
+        assert_eq!(agent.mode().await, "yolo");
+        assert_eq!(agent.set_mode_calls(), 1);
         assert_eq!(agent.send_calls(), 1);
     }
 
     #[tokio::test]
-    async fn execute_inner_skips_mode_update_when_already_matching() {
+    async fn execute_inner_reconfirms_session_mode_when_reported_already_matching() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "yolo", true));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
         let mut job = sample_job();
@@ -1733,7 +1925,7 @@ mod tests {
         );
         wait_for_agent_send(&agent, 1).await;
         assert_eq!(agent.mode().await, "yolo");
-        assert_eq!(agent.set_mode_calls(), 0);
+        assert_eq!(agent.set_mode_calls(), 1);
         assert_eq!(agent.send_calls(), 1);
     }
 

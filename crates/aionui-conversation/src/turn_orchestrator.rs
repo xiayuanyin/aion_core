@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentSendError, AgentSessionKind, IWorkerTaskManager};
+use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, AgentSessionKind, IWorkerTaskManager};
 use aionui_common::{AgentType, ConversationStatus, ErrorChain, now_ms};
 use aionui_db::models::ConversationRow;
 use tokio::sync::oneshot;
@@ -11,7 +11,7 @@ use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
 use crate::service::{
-    ConversationService, MAX_CRON_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
+    ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
 };
 use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
@@ -29,6 +29,7 @@ pub(crate) struct TurnStartInput {
     pub user_id: String,
     pub conversation: ConversationRow,
     pub request: SendMessageRequest,
+    pub required_runtime_mode: Option<String>,
     pub build_options: BuildTaskOptions,
     pub stored_workspace: String,
     pub turn_id: String,
@@ -60,6 +61,7 @@ struct TurnAttemptInput {
     send: SendMessageData,
     msg_id: String,
     allowed_skill_names: Vec<String>,
+    required_runtime_mode: Option<String>,
     continuation_count: usize,
     defer_clean_terminal_errors: bool,
 }
@@ -188,7 +190,7 @@ impl ConversationTurnOrchestrator {
         let runtime_state = self.service.runtime_state();
         let mut pending_send = Some((input.send, input.msg_id));
         let mut continuation_count = input.continuation_count;
-        let continuation_policy = TurnContinuationPolicy::new(MAX_CRON_CONTINUATIONS_PER_TURN);
+        let continuation_policy = TurnContinuationPolicy::new(MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN);
         let mut last_outcome = None;
         let mut aggregate_summary = TurnAttemptSummary::default();
 
@@ -205,7 +207,6 @@ impl ConversationTurnOrchestrator {
                 input.user_id.clone(),
                 self.service.conversation_repo().clone(),
                 self.service.broadcaster().clone(),
-                self.service.current_cron_service(),
             )
             .with_skill_resolver(self.service.skill_resolver())
             .with_allowed_skill_names(input.allowed_skill_names.clone())
@@ -215,6 +216,47 @@ impl ConversationTurnOrchestrator {
             .with_defer_clean_terminal_errors(defer_clean_terminal_errors);
 
             let rx = agent.subscribe();
+            if let Some(mode) = input
+                .required_runtime_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|mode| !mode.is_empty())
+            {
+                match apply_required_runtime_mode(&agent, mode).await {
+                    Ok(()) => {
+                        info!(
+                            conversation_id = %input.conv_id,
+                            turn_id = %input.turn_id,
+                            mode,
+                            "Confirmed required runtime mode before agent turn"
+                        );
+                    }
+                    Err(err) => {
+                        let top_level_code = agent_error_top_level_code(&err);
+                        let failure_message = err.to_string();
+                        let send_error = AgentSendError::from_agent_error(err);
+                        error!(
+                            conversation_id = %input.conv_id,
+                            turn_id = %input.turn_id,
+                            mode,
+                            error = %failure_message,
+                            "Failed to apply required runtime mode before agent turn"
+                        );
+                        self.service
+                            .persist_and_broadcast_send_failure_tip(
+                                &input.conv_id,
+                                &input.turn_id,
+                                &send_error,
+                                Some(top_level_code),
+                            )
+                            .await;
+                        return Err(ConversationTurnResult {
+                            status: ConversationTurnStatus::Failed,
+                            error_message: Some(failure_message),
+                        });
+                    }
+                }
+            }
             let send_agent = agent.clone();
             let conv_id_send = input.conv_id.clone();
             let turn_id_for_send = input.turn_id.clone();
@@ -337,6 +379,7 @@ impl ConversationTurnOrchestrator {
                     send: initial_send.clone(),
                     msg_id: first_turn_msg_id.clone(),
                     allowed_skill_names: allowed_skill_names.clone(),
+                    required_runtime_mode: input.required_runtime_mode.clone(),
                     continuation_count: 0,
                     defer_clean_terminal_errors: !replayed,
                 })
@@ -470,6 +513,11 @@ fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
             .map(str::to_owned),
         AgentSessionKind::Aionrs(_) => None,
     }
+}
+
+async fn apply_required_runtime_mode(agent: &AgentInstance, mode: &str) -> Result<(), AgentError> {
+    agent.set_config_option("mode", mode).await?;
+    Ok(())
 }
 
 fn send_error_display_message(error: &AgentSendError) -> String {

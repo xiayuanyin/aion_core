@@ -12,6 +12,7 @@ use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, TeamSessionBinding};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
+use chrono::Datelike;
 use tracing::{debug, warn};
 
 use crate::convert::string_to_enum;
@@ -84,6 +85,7 @@ impl<'a> SessionContextBuilder<'a> {
             workspace,
             model,
             skills,
+            runtime_env: Vec::new(),
             team,
             kind,
         })
@@ -107,7 +109,10 @@ impl<'a> SessionContextBuilder<'a> {
         if let Some(override_path) = workspace_override.map(str::trim).filter(|value| !value.is_empty()) {
             let normalized = match validate_workspace_path_availability(override_path) {
                 Ok(normalized) => normalized,
-                Err(error) => return Err(map_runtime_workspace_validation_error(error)),
+                Err(error) => {
+                    log_workspace_path_check(&row.id, &error);
+                    return Err(map_runtime_workspace_validation_error(error));
+                }
             };
             return Ok(WorkspaceContext {
                 path: normalized,
@@ -138,7 +143,10 @@ impl<'a> SessionContextBuilder<'a> {
             {
                 path
             }
-            Err(error) => return Err(map_runtime_workspace_validation_error(error)),
+            Err(error) => {
+                log_workspace_path_check(&row.id, &error);
+                return Err(map_runtime_workspace_validation_error(error));
+            }
         };
 
         Ok(WorkspaceContext {
@@ -456,10 +464,19 @@ fn expected_auto_workspace_path(
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
 ) -> PathBuf {
-    workspace_root.join("conversations").join(format!(
+    auto_workspace_parent(workspace_root).join(format!(
         "{}-temp-{conversation_id}",
         conversation_label(agent_type, backend)
     ))
+}
+
+fn auto_workspace_parent(workspace_root: &Path) -> PathBuf {
+    let now = chrono::Local::now();
+    workspace_root
+        .join("conversations")
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month()))
+        .join(format!("{:02}", now.day()))
 }
 
 fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
@@ -485,6 +502,30 @@ fn map_runtime_workspace_validation_error(error: WorkspacePathValidationError) -
     }
 }
 
+fn log_workspace_path_check(conversation_id: &str, error: &WorkspacePathValidationError) {
+    warn!(
+        target: "aionui_feedback_diagnostics",
+        diagnostic_event = "feedback.runtime.workspace_path_check",
+        conversation_id = %conversation_id,
+        path_present = !matches!(error, WorkspacePathValidationError::Empty),
+        path_exists = matches!(
+            error,
+            WorkspacePathValidationError::NotDirectory(_) | WorkspacePathValidationError::NotAccessible { .. }
+        ),
+        error_class = %workspace_error_class(error),
+        "feedback.runtime.workspace_path_check"
+    );
+}
+
+fn workspace_error_class(error: &WorkspacePathValidationError) -> &'static str {
+    match error {
+        WorkspacePathValidationError::Empty => "empty",
+        WorkspacePathValidationError::DoesNotExist(_) => "not_found",
+        WorkspacePathValidationError::NotDirectory(_) => "not_directory",
+        WorkspacePathValidationError::NotAccessible { .. } => "not_accessible",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +533,10 @@ mod tests {
         CreateAcpSessionParams, SaveRuntimeStateParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
         UpsertAgentMetadataParams, init_database_memory,
     };
+    use std::io::Write;
+    use std::sync::Mutex;
+    use tracing::Level;
+    use tracing_subscriber::fmt;
 
     struct TestRepos {
         workspace_root: PathBuf,
@@ -503,6 +548,36 @@ mod tests {
         fn builder(&self) -> SessionContextBuilder<'_> {
             SessionContextBuilder::new(&self.workspace_root, &self.metadata_repo, &self.acp_session_repo)
         }
+    }
+
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(max_level: Level, f: impl FnOnce()) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedBuf(Arc::clone(&buffer))
+        };
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(max_level)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
     }
 
     async fn setup() -> TestRepos {
@@ -917,6 +992,33 @@ mod tests {
         let context = repos.builder().build(&row).await.unwrap();
         assert!(context.workspace.is_custom);
         assert_eq!(context.workspace.path, custom.to_string_lossy());
+    }
+
+    #[test]
+    fn workspace_validation_failure_logs_redacted_runtime_check() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let raw_path = "/tmp/aionui-secret-workspace-token-12345";
+        let captured = capture_logs(Level::WARN, || {
+            runtime.block_on(async {
+                let repos = setup().await;
+                let row = row("aionrs", serde_json::json!({ "workspace": raw_path }), None);
+
+                let err = repos.builder().build(&row).await.unwrap_err();
+                assert!(matches!(err, ConversationError::WorkspacePathRuntimeUnavailable { .. }));
+            });
+        });
+
+        assert!(captured.contains("aionui_feedback_diagnostics"), "{captured}");
+        assert!(captured.contains("feedback.runtime.workspace_path_check"), "{captured}");
+        assert!(captured.contains("conversation_id=conv-1"), "{captured}");
+        assert!(captured.contains("path_present=true"), "{captured}");
+        assert!(captured.contains("path_exists=false"), "{captured}");
+        assert!(captured.contains("error_class=not_found"), "{captured}");
+        assert!(!captured.contains(raw_path), "{captured}");
+        assert!(!captured.contains("token-12345"), "{captured}");
     }
 
     fn assert_archived(err: ConversationError, expected_id: &str) {

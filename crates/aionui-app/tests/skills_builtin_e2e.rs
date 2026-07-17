@@ -125,14 +125,22 @@ async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() 
         })
         .collect();
     assert!(
-        auto_items.len() >= 3,
-        "expected ≥3 auto-inject entries, got {}",
+        !auto_items.is_empty(),
+        "expected at least one auto-inject entry, got {}",
         auto_items.len()
     );
     let names: Vec<&str> = auto_items.iter().filter_map(|item| item["name"].as_str()).collect();
     assert!(
+        names.contains(&"aionui-config"),
+        "aionui-config should be shipped as an auto-inject builtin skill: {names:?}",
+    );
+    assert!(
         !names.contains(&"aionui-skills"),
         "aionui-skills should not be shipped as an auto-inject builtin skill: {names:?}",
+    );
+    assert!(
+        !names.contains(&"cron"),
+        "cron should not be shipped as an auto-inject builtin skill: {names:?}",
     );
     for item in auto_items {
         assert!(item["name"].is_string());
@@ -157,7 +165,7 @@ async fn builtin_skill_read_auto_inject_returns_frontmatter_content() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-skill",
-            json!({"file_name": "auto-inject/cron/SKILL.md"}),
+            json!({"file_name": "auto-inject/aionui-config/SKILL.md"}),
             &fx.token,
             &fx.csrf,
         ))
@@ -331,7 +339,7 @@ async fn materialize_for_agent_returns_source_path_for_auto_inject_skill() {
     // Post-snapshot contract: `materialize-for-agent` resolves each
     // requested name to its on-disk source directory without copying.
     // The frontend symlinks `source_path` into the CLI's native skills
-    // dir. `cron` lives under `auto-inject/cron/` in the builtin tree.
+    // dir. `aionui-config` lives under `auto-inject/aionui-config/` in the builtin tree.
     let fx = fixture_embedded().await;
 
     let resp = fx
@@ -342,7 +350,7 @@ async fn materialize_for_agent_returns_source_path_for_auto_inject_skill() {
             "/api/skills/materialize-for-agent",
             json!({
                 "conversation_id": "conv-happy",
-                "skills": ["cron"],
+                "skills": ["aionui-config"],
             }),
             &fx.token,
             &fx.csrf,
@@ -353,7 +361,7 @@ async fn materialize_for_agent_returns_source_path_for_auto_inject_skill() {
     let json: Value = body_json(resp).await;
     let skills = json["data"]["skills"].as_array().unwrap();
     assert_eq!(skills.len(), 1);
-    assert_eq!(skills[0]["name"], "cron");
+    assert_eq!(skills[0]["name"], "aionui-config");
     let source_path = skills[0]["source_path"].as_str().unwrap();
     let path = std::path::Path::new(source_path);
     assert!(path.is_absolute(), "source_path must be absolute: {source_path}");
@@ -462,7 +470,7 @@ async fn materialize_for_agent_returns_sorted_list() {
             "/api/skills/materialize-for-agent",
             json!({
                 "conversation_id": "conv-sorted",
-                "skills": ["mermaid", "cron"],
+                "skills": ["mermaid", "aionui-config"],
             }),
             &fx.token,
             &fx.csrf,
@@ -473,7 +481,7 @@ async fn materialize_for_agent_returns_sorted_list() {
     let json: Value = body_json(resp).await;
     let skills = json["data"]["skills"].as_array().unwrap();
     assert_eq!(skills.len(), 2);
-    assert_eq!(skills[0]["name"], "cron");
+    assert_eq!(skills[0]["name"], "aionui-config");
     assert_eq!(skills[1]["name"], "mermaid");
 }
 

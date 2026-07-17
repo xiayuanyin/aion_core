@@ -85,7 +85,7 @@ pub struct AionrsBuildExtra {
     #[serde(default)]
     pub skills: Vec<String>,
     #[serde(default = "default_aionrs_max_tokens")]
-    pub max_tokens: u32,
+    pub max_tokens: Option<u32>,
     #[serde(default)]
     pub max_turns: Option<usize>,
     #[serde(default)]
@@ -106,8 +106,8 @@ pub struct AionrsBuildExtra {
     pub user_id: Option<String>,
 }
 
-fn default_aionrs_max_tokens() -> u32 {
-    65536
+fn default_aionrs_max_tokens() -> Option<u32> {
+    Some(65536)
 }
 
 /// ACP model information returned by the ACP backend.
