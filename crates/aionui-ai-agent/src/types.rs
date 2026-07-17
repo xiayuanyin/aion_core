@@ -197,7 +197,7 @@ mod tests {
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert!(extra.system_prompt.is_none());
         assert!(extra.preset_rules.is_none());
-        assert_eq!(extra.max_tokens, 8192);
+        assert_eq!(extra.max_tokens, 65536);
         assert!(extra.max_turns.is_none());
         assert!(extra.max_tool_call_malformed_turns.is_none());
         assert!(extra.max_tool_call_failure_turns.is_none());
