@@ -4,7 +4,7 @@ mod types;
 
 use std::sync::OnceLock;
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 pub use managed::{install_and_validate as install_managed_runtime, probe_support as probe_node_runtime_supported};
 pub use system::{derive_runtime_root, tool_command, validate_same_root};
@@ -21,7 +21,7 @@ pub fn probe_runtime_command(command: &str) -> RuntimeCommandProbe {
     let trimmed = command.trim();
     let path = std::path::Path::new(trimmed);
 
-    let probe = if path.is_absolute() || trimmed.contains('/') || trimmed.contains('\\') {
+    if path.is_absolute() || trimmed.contains('/') || trimmed.contains('\\') {
         RuntimeCommandProbe::ExplicitPath {
             path: path.to_path_buf(),
         }
@@ -43,10 +43,7 @@ pub fn probe_runtime_command(command: &str) -> RuntimeCommandProbe {
                 command: trimmed.to_owned(),
             },
         }
-    };
-
-    log_probe_decision(&probe);
-    probe
+    }
 }
 
 pub async fn ensure_node_runtime() -> Result<ResolvedNodeRuntime, NodeRuntimeError> {
@@ -107,20 +104,6 @@ fn runtime_source_label(source: ResolvedNodeSource) -> &'static str {
     match source {
         ResolvedNodeSource::Bundled => "bundled",
         ResolvedNodeSource::Managed => "managed",
-    }
-}
-
-fn log_probe_decision(probe: &RuntimeCommandProbe) {
-    match probe {
-        RuntimeCommandProbe::ExplicitPath { path } => {
-            debug!(command = %path.display(), probe = "explicit-path", "node runtime probe decided");
-        }
-        RuntimeCommandProbe::PathLookup { command } => {
-            debug!(command, probe = "path-lookup", "node runtime probe decided");
-        }
-        RuntimeCommandProbe::NodeTool { tool, command } => {
-            debug!(command, tool = ?tool, probe = "node-tool", "node runtime probe decided");
-        }
     }
 }
 

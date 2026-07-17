@@ -51,6 +51,66 @@ fn probe_resolved_command_accepts_bare_npx_when_managed_runtime_is_supported() {
     assert_eq!(resolved, PathBuf::from("npx"));
 }
 
+fn catalog_metadata(agent_type: AgentType, command: &str) -> AgentMetadata {
+    AgentMetadata {
+        id: "agent-external".into(),
+        icon: None,
+        name: "External Agent".into(),
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("custom".into()),
+        agent_type,
+        agent_source: AgentSource::Custom,
+        agent_source_info: AgentSourceInfo::default(),
+        enabled: true,
+        available: false,
+        command: Some(command.into()),
+        resolved_command: None,
+        args: vec![],
+        env: vec![],
+        native_skills_dirs: None,
+        behavior_policy: BehaviorPolicy::default(),
+        yolo_id: None,
+        sort_order: 0,
+        team_capable: false,
+        last_check_status: None,
+        last_check_kind: None,
+        last_check_error_code: None,
+        last_check_error_message: None,
+        last_check_error_details: None,
+        last_check_guidance: None,
+        last_check_latency_ms: None,
+        last_check_at: None,
+        last_success_at: None,
+        last_failure_at: None,
+        handshake: AgentHandshake::default(),
+        has_command_override: false,
+        env_override_key_count: 0,
+    }
+}
+
+#[test]
+fn catalog_availability_defers_external_acp_path_lookup() {
+    let mut meta = catalog_metadata(AgentType::Acp, "definitely-missing-external-acp");
+
+    assert!(apply_catalog_availability(&mut meta).is_none());
+    assert!(meta.available);
+    assert!(meta.resolved_command.is_none());
+}
+
+#[test]
+fn catalog_availability_keeps_non_acp_path_probe() {
+    let mut meta = catalog_metadata(AgentType::Nanobot, "definitely-missing-external-cli");
+
+    assert!(matches!(
+        apply_catalog_availability(&mut meta),
+        Some(UnavailableReason::CommandMissing { .. })
+    ));
+    assert!(!meta.available);
+    assert!(meta.resolved_command.is_none());
+}
+
 #[test]
 fn probe_resolved_command_does_not_require_primary_binary_for_builtin_managed_claude() {
     if !probe_node_runtime_supported().is_supported()
@@ -168,7 +228,7 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
         description: None,
         description_i18n: None,
         backend: Some("custom"),
-        agent_type: "acp",
+        agent_type: "nanobot",
         agent_source: "custom",
         agent_source_info: Some(r#"{"binary_name":"definitely-missing-cli"}"#),
         enabled: true,

@@ -49,7 +49,7 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
     repo.upsert(&custom_params(
         "agent-missing",
         "Missing Agent",
-        "aionui-missing-agent-binary",
+        "",
         r#"{"binary_name":"aionui-missing-agent-binary"}"#,
     ))
     .await

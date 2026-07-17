@@ -72,7 +72,7 @@ async fn test_custom_agent_nonexistent_command() {
 }
 
 #[tokio::test]
-async fn management_list_includes_missing_custom_agents() {
+async fn management_list_defers_custom_agent_command_checks() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
@@ -117,8 +117,8 @@ async fn management_list_includes_missing_custom_agents() {
     let row = rows
         .iter()
         .find(|item| item["id"].as_str() == Some("custom-missing-agent"))
-        .expect("management list should include missing custom agent");
-    assert_eq!(row["status"], "missing");
+        .expect("management list should include custom agent");
+    assert_eq!(row["status"], "online");
 }
 
 #[tokio::test]
@@ -198,7 +198,7 @@ async fn legacy_agents_endpoint_is_not_found() {
 }
 
 #[tokio::test]
-async fn health_check_by_id_returns_missing_status_for_uninstalled_agent() {
+async fn health_check_by_id_reports_uninstalled_agent_offline() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
@@ -246,7 +246,8 @@ async fn health_check_by_id_returns_missing_status_for_uninstalled_agent() {
 
     let body = body_json(resp).await;
     assert_eq!(body["data"]["id"], "custom-missing-agent");
-    assert_eq!(body["data"]["status"], "missing");
+    assert_eq!(body["data"]["status"], "offline");
+    assert_eq!(body["data"]["last_check_error_code"], "command_not_found");
 }
 
 // ── Session-bound ACP routes (no active task → 404) ──────────────

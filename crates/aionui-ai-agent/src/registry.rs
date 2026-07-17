@@ -5,8 +5,8 @@
 //! rows all live there. The registry:
 //!
 //! - hydrates `select *` into memory at startup;
-//! - probes each row's spawn command via `which()` so the `available`
-//!   field reflects PATH state right now (not a persisted column);
+//! - derives catalog availability for each row; external ACP command
+//!   checks are deferred until manual connection tests or session startup;
 //! - exposes lookups the factory and routes use (`get`,
 //!   `find_by_backend`, `list_by_agent_type`, etc.);
 //! - writes ACP handshake payloads back to the row through
@@ -159,8 +159,8 @@ impl AgentRegistry {
             tx: self.catalog_tx.clone(),
         }
     }
-    /// Reload every enabled row from the database and re-probe their
-    /// spawn commands on `$PATH`.
+    /// Reload every enabled row from the database and refresh catalog
+    /// availability. External ACP command checks are deferred until use.
     pub async fn hydrate(&self) -> Result<(), AgentError> {
         let rows = self
             .repo
@@ -173,7 +173,9 @@ impl AgentRegistry {
             let Some((meta, reason)) = decode_row(row) else {
                 continue;
             };
-            log_probe_result(&meta, &reason);
+            if should_probe_catalog_command(&meta) {
+                log_probe_result(&meta, &reason);
+            }
             map.insert(meta.id.clone(), meta);
         }
         // Snapshot the summary off the local map before transferring it
@@ -184,21 +186,22 @@ impl AgentRegistry {
         Ok(())
     }
 
-    /// Re-probe every row's command without refetching from the DB.
-    /// Useful after PATH has changed (e.g. `launchctl setenv`).
+    /// Refresh every row's catalog availability without refetching from the
+    /// DB. External ACP commands are not probed here; manual connection tests
+    /// and session startup resolve them when the user actually needs them.
     pub async fn refresh_availability(&self) {
         let mut guard = self.by_id.write().await;
         for meta in guard.values_mut() {
-            let (path, reason) = probe_with_reason(meta);
-            meta.resolved_command = path;
-            meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(meta);
-            let reason = if meta.available { None } else { reason };
-            log_probe_result(meta, &reason);
+            let reason = apply_catalog_availability(meta);
+            if should_probe_catalog_command(meta) {
+                log_probe_result(meta, &reason);
+            }
         }
         log_availability_summary(guard.values(), "AgentRegistry refresh_availability complete");
     }
 
-    /// Refetch every row from the repository, then re-resolve PATH.
+    /// Refetch every row from the repository, then refresh catalog
+    /// availability under the same deferred-probe rules as [`Self::hydrate`].
     ///
     /// Called after any mutation that changed the set of rows on disk
     /// (create/delete) or the spawn command of an existing row
@@ -504,10 +507,7 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
         }
     }
 
-    let (path, reason) = probe_with_reason(&meta);
-    meta.resolved_command = path;
-    meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(&meta);
-    let reason = if meta.available { None } else { reason };
+    let reason = apply_catalog_availability(&mut meta);
     Some((meta, reason))
 }
 
@@ -519,10 +519,52 @@ fn is_internal_commandless_agent(meta: &AgentMetadata) -> bool {
     meta.enabled && meta.command.is_none() && meta.agent_source == AgentSource::Internal
 }
 
+fn should_probe_catalog_command(meta: &AgentMetadata) -> bool {
+    meta.agent_type != AgentType::Acp || meta.agent_source == AgentSource::Internal
+}
+
+/// Update the catalog-facing availability fields without touching external
+/// ACP runtimes. ACP command resolution is intentionally deferred to manual
+/// connection tests and session startup, both of which return actionable
+/// errors to the user.
+fn apply_catalog_availability(meta: &mut AgentMetadata) -> Option<UnavailableReason> {
+    if should_probe_catalog_command(meta) {
+        let (path, reason) = probe_with_reason(meta);
+        meta.resolved_command = path;
+        meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(meta);
+        return if meta.available { None } else { reason };
+    }
+
+    meta.resolved_command = None;
+    if !meta.enabled {
+        meta.available = false;
+        return Some(UnavailableReason::Disabled);
+    }
+
+    let is_managed_builtin = meta.agent_source == AgentSource::Builtin
+        && meta
+            .backend
+            .as_deref()
+            .and_then(ManagedAcpToolId::from_backend)
+            .is_some();
+    if is_managed_builtin
+        || meta
+            .command
+            .as_deref()
+            .is_some_and(|command| !command.trim().is_empty())
+    {
+        meta.available = true;
+        None
+    } else {
+        meta.available = false;
+        Some(UnavailableReason::NoCommand)
+    }
+}
+
 /// Wrapper around [`probe_resolved_command`] that returns both the
 /// resolved path (if any) and the failure reason as a tuple, so the
-/// hydrate / refresh loops can persist the path and emit a single
-/// uniform log line per row.
+/// non-ACP hydrate / refresh paths can persist the path and emit a single
+/// uniform log line per probed row.
 fn probe_with_reason(meta: &AgentMetadata) -> (Option<PathBuf>, Option<UnavailableReason>) {
     match probe_resolved_command(meta) {
         Ok(path) => (Some(path), None),
