@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use crate::agent_catalog::AssistantAgentCatalogPort;
 #[cfg(test)]
 use crate::builtin::BuiltinAssistant;
-use crate::builtin::{AvatarAsset, BuiltinAssistantRegistry};
+use crate::builtin::{AvatarAsset, BuiltinAssistantRegistry, DISPATCHER_ASSISTANT_ID};
 use crate::error::AssistantError;
 
 /// Aggregated business logic for `/api/assistants/*` and rule/skill dispatch.
@@ -900,6 +900,11 @@ impl AssistantService {
     pub async fn update(&self, id: &str, req: UpdateAssistantRequest) -> Result<AssistantResponse, AssistantError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => {
+                if id == DISPATCHER_ASSISTANT_ID {
+                    return Err(AssistantError::Forbidden(
+                        "Dispatcher configuration is managed by AionUi and cannot be changed".into(),
+                    ));
+                }
                 let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
                 let builtin_defaults_forbidden = req
                     .defaults
@@ -1297,6 +1302,12 @@ impl AssistantService {
         id: &str,
         req: SetAssistantStateRequest,
     ) -> Result<AssistantResponse, AssistantError> {
+        if id == DISPATCHER_ASSISTANT_ID && matches!(self.classify_source(id).await, AssistantSource::Builtin) {
+            return Err(AssistantError::Forbidden(
+                "Dispatcher state is managed by AionUi and cannot be changed".into(),
+            ));
+        }
+
         match self.classify_source(id).await {
             AssistantSource::Builtin | AssistantSource::Generated => {}
             AssistantSource::User => {
@@ -4706,6 +4717,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AssistantError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_rejects_all_configuration_and_state_changes() {
+        let fx = fixture_with_builtins(vec![mk_builtin(DISPATCHER_ASSISTANT_ID, "Dispatcher")]).await;
+
+        let update_error = fx
+            .service
+            .update(
+                DISPATCHER_ASSISTANT_ID,
+                UpdateAssistantRequest {
+                    agent_id: Some("2d23ff1c".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(update_error, AssistantError::Forbidden(_)));
+
+        let state_error = fx
+            .service
+            .set_state(
+                DISPATCHER_ASSISTANT_ID,
+                SetAssistantStateRequest {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(state_error, AssistantError::Forbidden(_)));
     }
 
     #[tokio::test]

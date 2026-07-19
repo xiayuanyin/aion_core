@@ -29,6 +29,8 @@ use tracing::{error, warn};
 /// `crates/aionui-app/assets/builtin-assistants/`.
 static BUILTIN_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../aionui-app/assets/builtin-assistants");
 
+pub const DISPATCHER_ASSISTANT_ID: &str = "dispatcher";
+
 /// Single built-in assistant entry, loaded from `assistants.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BuiltinAssistant {
@@ -296,8 +298,19 @@ mod tests {
         let reg = BuiltinAssistantRegistry::load_embedded();
         assert!(!reg.is_empty(), "embedded registry should contain the shipped presets");
         // Sanity-check a couple of known ids from the committed manifest.
+        assert!(reg.has(DISPATCHER_ASSISTANT_ID));
         assert!(reg.has("word-creator"));
         assert!(reg.has("cowork"));
+
+        let dispatcher = reg
+            .get(DISPATCHER_ASSISTANT_ID)
+            .expect("dispatcher preset should exist");
+        assert!(dispatcher.default_enabled);
+        assert_eq!(dispatcher.sort_order, -10000);
+        assert_eq!(
+            dispatcher.enabled_skills,
+            ["aionui-config", "skill-creator", "anysearch", "grill-me"]
+        );
     }
 
     #[test]
@@ -309,6 +322,18 @@ mod tests {
         assert!(!bytes.is_empty());
         let text = std::str::from_utf8(&bytes).expect("rule file should be valid utf-8");
         assert!(text.len() > 100, "rule file should have real content");
+    }
+
+    #[test]
+    fn load_embedded_dispatcher_rule_defines_immediate_handoff() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        let bytes = reg
+            .rule_bytes(DISPATCHER_ASSISTANT_ID, "zh-CN")
+            .expect("shipped dispatcher zh-CN rule should resolve from the embedded bundle");
+        let text = std::str::from_utf8(&bytes).expect("rule file should be valid utf-8");
+        assert!(text.contains("现在已经交由"));
+        assert!(text.contains("team_spawn_agent"));
+        assert!(text.contains("team_send_message"));
     }
 
     #[test]

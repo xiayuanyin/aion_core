@@ -461,7 +461,18 @@ impl CronService {
         let mut jobs = Vec::with_capacity(rows.len());
         for row in rows {
             let mut job = cron_job_from_row(row)?;
-            job.agent_type = self.resolve_job_agent_type(&job).await?;
+            job.agent_type = match self.resolve_job_agent_type(&job).await {
+                Ok(agent_type) => agent_type,
+                Err(CronError::AssistantNotFound(assistant_id)) => {
+                    warn!(
+                        job_id = %job.id,
+                        assistant_id,
+                        "Skipping cron job because its assistant no longer exists"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             jobs.push(job);
         }
         Ok(jobs)
@@ -833,7 +844,7 @@ impl CronService {
             .assistant_definition_repo
             .get_by_assistant_id(assistant_id)
             .await?
-            .ok_or_else(|| CronError::InvalidAgentConfig(format!("assistant '{assistant_id}' not found")))?;
+            .ok_or_else(|| CronError::AssistantNotFound(assistant_id.to_owned()))?;
         let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
         let effective_agent_id = overlay
             .as_ref()

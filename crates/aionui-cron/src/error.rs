@@ -29,6 +29,9 @@ pub enum CronError {
     #[error("Invalid agent config: {0}")]
     InvalidAgentConfig(String),
 
+    #[error("assistant '{0}' not found")]
+    AssistantNotFound(String),
+
     #[error("Scheduler error: {0}")]
     Scheduler(String),
 

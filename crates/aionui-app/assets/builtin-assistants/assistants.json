@@ -2,6 +2,54 @@
   "version": "1.0.0",
   "assistants": [
     {
+      "id": "dispatcher",
+      "name": "Dispatcher",
+      "name_i18n": {
+        "en-US": "Dispatcher",
+        "zh-CN": "调度台",
+        "ru-RU": "Диспетчер",
+        "uk-UA": "Диспетчер"
+      },
+      "description": "Routes each request to the best available assistant and coordinates delivery of the result.",
+      "description_i18n": {
+        "en-US": "Routes each request to the best available assistant and coordinates delivery of the result.",
+        "zh-CN": "识别任务意图，将请求交给最合适的助手，并协调返回结果。",
+        "ru-RU": "Направляет каждый запрос наиболее подходящему помощнику и координирует получение результата.",
+        "uk-UA": "Спрямовує кожен запит найбільш відповідному помічнику та координує отримання результату."
+      },
+      "avatar": "avatars/aionui-assistant.jpg",
+      "agent_ref": "aionrs",
+      "enabled_skills": [
+        "aionui-config",
+        "skill-creator",
+        "anysearch",
+        "grill-me"
+      ],
+      "custom_skill_names": [],
+      "disabled_builtin_skills": [],
+      "rule_file": "rules/dispatcher.{locale}.md",
+      "prompts": [
+        "Help me choose the right assistant for this task"
+      ],
+      "prompts_i18n": {
+        "en-US": [
+          "Help me choose the right assistant for this task"
+        ],
+        "zh-CN": [
+          "帮我选择合适的助手来处理这个任务"
+        ],
+        "ru-RU": [
+          "Помоги выбрать подходящего помощника для этой задачи"
+        ],
+        "uk-UA": [
+          "Допоможи вибрати відповідного помічника для цього завдання"
+        ]
+      },
+      "models": [],
+      "sort_order": -10000,
+      "default_enabled": true
+    },
+    {
       "id": "word-creator",
       "name": "Word Creator",
       "name_i18n": {

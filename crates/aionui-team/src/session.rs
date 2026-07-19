@@ -40,6 +40,8 @@ use crate::work_coordinator::{
 };
 use crate::work_source::WorkSource;
 
+const DISPATCHER_ASSISTANT_ID: &str = "dispatcher";
+
 /// Input for the wake path. Produced by [`TeamSession::compute_wake_input`],
 /// consumed by D7b's `send_message` / `send_message_to_agent` (not implemented
 /// in D7a). `first_message` includes the role prompt on cold starts.
@@ -359,12 +361,25 @@ impl TeamSession {
                 let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
                 let first_message = if needs_role_prompt {
                     let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
+                    let available_assistants = if agent.assistant_id.as_deref() == Some(DISPATCHER_ASSISTANT_ID) {
+                        match self.service.upgrade() {
+                            Some(service) => service
+                                .list_team_selectable_assistants()
+                                .await
+                                .into_iter()
+                                .filter(|assistant| assistant.assistant_id != DISPATCHER_ASSISTANT_ID)
+                                .collect(),
+                            None => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     let role_prompt = match agent.role {
                         TeammateRole::Lead => build_lead_prompt_for_transport(
                             &agent,
                             &self.team.name,
                             &self.scheduler.list_agents().await,
-                            &[],
+                            &available_assistants,
                             tool_transport,
                         ),
                         TeammateRole::Teammate => {

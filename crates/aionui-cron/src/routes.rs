@@ -41,6 +41,9 @@ impl From<CronError> for ApiError {
             CronError::InvalidTimezone(msg) => ApiError::BadRequest(msg),
             CronError::InvalidSkillContent(msg) => ApiError::BadRequest(msg),
             CronError::InvalidAgentConfig(msg) => ApiError::BadRequest(msg),
+            CronError::AssistantNotFound(assistant_id) => {
+                ApiError::BadRequest(format!("assistant '{assistant_id}' not found"))
+            }
             CronError::Scheduler(msg) => ApiError::Internal(msg),
             CronError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
             CronError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
@@ -317,6 +320,12 @@ mod tests {
     fn invalid_agent_config_maps_to_bad_request() {
         let err: ApiError = CronError::InvalidAgentConfig("missing backend".into()).into();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn missing_assistant_maps_to_bad_request() {
+        let err: ApiError = CronError::AssistantNotFound("cloud-ai".into()).into();
+        assert!(matches!(err, ApiError::BadRequest(message) if message == "assistant 'cloud-ai' not found"));
     }
 
     #[test]

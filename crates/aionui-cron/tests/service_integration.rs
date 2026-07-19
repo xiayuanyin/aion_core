@@ -1284,7 +1284,7 @@ async fn create_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() 
         .await
         .expect_err("missing assistant must not fall back to backend");
 
-    assert!(matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)));
+    assert!(matches!(err, aionui_cron::error::CronError::AssistantNotFound(_)));
     assert!(err.to_string().contains("missing-assistant"), "unexpected error: {err}");
 }
 
@@ -1396,6 +1396,53 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
         .find(|job| job.id == "cron_legacy_custom_agent")
         .expect("legacy job should be listed");
     assert_eq!(legacy.agent_type, "acp");
+}
+
+#[tokio::test]
+async fn list_jobs_skips_jobs_whose_assistant_no_longer_exists() {
+    let (svc, cron_repo, _) = setup().await;
+    let valid_job = svc.add_job(make_create_req("Valid job", every_60s())).await.unwrap();
+    cron_repo
+        .insert(&CronJobRow {
+            id: "cron_missing_assistant".into(),
+            name: "Missing assistant job".into(),
+            enabled: true,
+            schedule_kind: "every".into(),
+            schedule_value: "60000".into(),
+            schedule_tz: None,
+            schedule_description: Some("every minute".into()),
+            payload_message: "ping".into(),
+            execution_mode: "new_conversation".into(),
+            agent_config: Some(
+                serde_json::json!({
+                    "name": "Deleted assistant",
+                    "assistant_id": "cloud-ai"
+                })
+                .to_string(),
+            ),
+            conversation_id: "conv_missing_assistant".into(),
+            conversation_title: None,
+            created_by: "user".into(),
+            skill_content: None,
+            description: None,
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            next_run_at: None,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            run_count: 0,
+            retry_count: 0,
+            max_retries: 3,
+            queue_enabled: false,
+        })
+        .await
+        .unwrap();
+
+    let jobs = svc.list_jobs(&ListCronJobsQuery::default()).await.unwrap();
+
+    assert!(jobs.iter().any(|job| job.id == valid_job.id));
+    assert!(!jobs.iter().any(|job| job.id == "cron_missing_assistant"));
 }
 
 // ── CJ-7: List by conversation ────────────────────────────────────
@@ -1801,7 +1848,7 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
         .await
         .expect_err("missing assistant must not fall back to backend");
 
-    assert!(matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)));
+    assert!(matches!(err, aionui_cron::error::CronError::AssistantNotFound(_)));
     assert!(
         err.to_string().contains("assistant 'missing-assistant' not found"),
         "unexpected error: {err}"
