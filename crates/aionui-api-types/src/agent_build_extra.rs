@@ -173,10 +173,11 @@ mod tests {
     }
 
     #[test]
-    fn aionrs_build_extra_ignores_legacy_guide_config_field() {
+    fn aionrs_build_extra_ignores_legacy_fields() {
         let legacy_key = concat!("guide", "_mcp_config");
         let parsed: AionrsBuildExtra = serde_json::from_value(serde_json::json!({
             "backend": "aionrs",
+            "max_tokens": 8192,
             legacy_key: {"port": 1234, "token": "legacy", "binary_path": "/bin/aioncore"}
         }))
         .unwrap();
@@ -186,6 +187,10 @@ mod tests {
         assert!(
             serialized.get(legacy_key).is_none(),
             "legacy guide config must be ignored, not re-serialized"
+        );
+        assert!(
+            serialized.get("max_tokens").is_none(),
+            "legacy max_tokens must be ignored, not re-serialized"
         );
     }
 }
