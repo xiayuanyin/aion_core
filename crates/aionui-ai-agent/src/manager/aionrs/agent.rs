@@ -144,11 +144,7 @@ impl AionrsAgentManager {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
         let runtime_env = config_extra.runtime_env.clone();
-        let image_input_capability = resolve_image_input_capability(
-            &config_extra.provider,
-            config_extra.base_url.as_deref(),
-            &config_extra.model,
-        );
+        let image_input_capability = resolve_image_input_capability(&config_extra.model);
         info!(
             conversation_id = %conversation_id,
             provider = %config_extra.provider,

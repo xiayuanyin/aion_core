@@ -15,24 +15,14 @@ fn catalog() -> ImageInputCatalog {
             "google": {
                 "models": ["gemini-2.5-flash"]
             },
-            "dashscope": {
-                "api": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                "models": ["qwen3.7-plus"]
-            },
-            "moonshot-global": {
-                "api": "https://api.moonshot.ai/v1",
-                "models": ["kimi-k2.6"]
-            },
-            "openrouter": {
-                "api": "https://openrouter.ai/api/v1",
-                "models": []
-            },
             "amazon-bedrock": {
                 "models": ["anthropic.claude-sonnet-4-20250514-v1:0"]
             },
-            "deepseek": {
-                "api": "https://api.deepseek.com",
-                "models": ["deepseek-vl"]
+            "dashscope": {
+                "models": ["qwen3.7-plus"]
+            },
+            "moonshot-global": {
+                "models": ["kimi-k2.6"]
             }
         }
     }))
@@ -40,11 +30,17 @@ fn catalog() -> ImageInputCatalog {
 }
 
 #[test]
-fn embedded_allowlist_is_valid_and_contains_regression_provider() {
+fn embedded_allowlist_is_valid_and_contains_regression_models() {
     let catalog = parse_catalog(IMAGE_INPUT_CATALOG_JSON).expect("valid embedded catalog");
 
-    assert!(catalog.providers.contains_key("dashscope"));
-    assert!(catalog.providers.contains_key("moonshot-global"));
+    assert_eq!(
+        resolve_from_catalog(&catalog, "qwen3.7-plus"),
+        ImageInputCapability::Supported
+    );
+    assert_eq!(
+        resolve_from_catalog(&catalog, "kimi-k2.6"),
+        ImageInputCapability::Supported
+    );
 }
 
 #[test]
@@ -56,64 +52,28 @@ fn rejects_unknown_catalog_schema_version() {
 }
 
 #[test]
-fn embedded_allowlist_resolves_regression_models_without_network() {
+fn embedded_allowlist_resolves_models_by_name_only() {
     assert_eq!(
-        resolve_image_input_capability(
-            "openai",
-            Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            "qwen3.7-plus",
-        ),
+        resolve_image_input_capability("qwen3.7-plus"),
         ImageInputCapability::Supported
     );
     assert_eq!(
-        resolve_image_input_capability(
-            "openai",
-            Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            "kimi-k2.6",
-        ),
-        ImageInputCapability::Unknown
-    );
-    assert_eq!(
-        resolve_image_input_capability("openai", Some("https://api.moonshot.ai/v1"), "kimi-k2.6"),
+        resolve_image_input_capability("kimi-k2.6"),
         ImageInputCapability::Supported
     );
 }
 
 #[test]
-fn resolves_supported_and_unlisted_models_on_the_same_provider() {
+fn resolves_known_models_from_any_catalog_provider() {
     let catalog = catalog();
 
     assert_eq!(
-        resolve_from_catalog(
-            &catalog,
-            "openai",
-            Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            "qwen3.7-plus",
-        ),
+        resolve_from_catalog(&catalog, "gpt-4o"),
         ImageInputCapability::Supported
     );
     assert_eq!(
-        resolve_from_catalog(
-            &catalog,
-            "openai",
-            Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            "kimi-k2.6",
-        ),
-        ImageInputCapability::Unknown
-    );
-}
-
-#[test]
-fn resolves_same_model_id_by_provider_api_not_model_name_alone() {
-    let catalog = catalog();
-
-    assert_eq!(
-        resolve_from_catalog(&catalog, "openai", Some("https://api.moonshot.ai/v1"), "kimi-k2.6",),
+        resolve_from_catalog(&catalog, "kimi-k2.6"),
         ImageInputCapability::Supported
-    );
-    assert_eq!(
-        resolve_from_catalog(&catalog, "openai", Some("https://openrouter.ai/api/v1"), "kimi-k2.6",),
-        ImageInputCapability::Unknown
     );
 }
 
@@ -126,61 +86,16 @@ fn normalizes_bedrock_inference_profile_prefixes() {
         "us.anthropic.claude-sonnet-4-20250514-v1:0",
         "global.anthropic.claude-sonnet-4-20250514-v1:0",
     ] {
-        assert_eq!(
-            resolve_from_catalog(&catalog, "bedrock", None, model),
-            ImageInputCapability::Supported
-        );
+        assert_eq!(resolve_from_catalog(&catalog, model), ImageInputCapability::Supported);
     }
 }
 
 #[test]
-fn normalizes_full_endpoint_and_optional_v1_suffix() {
+fn unknown_model_fails_closed_as_unknown() {
     let catalog = catalog();
 
     assert_eq!(
-        resolve_from_catalog(
-            &catalog,
-            "openai",
-            Some("https://api.deepseek.com/v1/chat/completions?trace=1"),
-            "deepseek-vl",
-        ),
-        ImageInputCapability::Supported
-    );
-}
-
-#[test]
-fn maps_official_provider_hosts_without_catalog_api_urls() {
-    let catalog = catalog();
-
-    assert_eq!(
-        resolve_from_catalog(&catalog, "openai", Some("https://api.openai.com/v1"), "gpt-4o",),
-        ImageInputCapability::Supported
-    );
-    assert_eq!(
-        resolve_from_catalog(
-            &catalog,
-            "openai",
-            Some("https://generativelanguage.googleapis.com/v1beta/openai"),
-            "models/gemini-2.5-flash",
-        ),
-        ImageInputCapability::Supported
-    );
-}
-
-#[test]
-fn unknown_provider_or_model_fails_closed_as_unknown() {
-    let catalog = catalog();
-
-    assert_eq!(
-        resolve_from_catalog(&catalog, "openai", Some("https://private.example/v1"), "gpt-4o",),
-        ImageInputCapability::Unknown
-    );
-    assert_eq!(
-        resolve_from_catalog(&catalog, "openai", Some("https://api.openai.com/v1"), "missing-model"),
-        ImageInputCapability::Unknown
-    );
-    assert_eq!(
-        resolve_from_catalog(&catalog, "openai", Some("not-a-url"), "gpt-4o"),
+        resolve_from_catalog(&catalog, "missing-model"),
         ImageInputCapability::Unknown
     );
 }
