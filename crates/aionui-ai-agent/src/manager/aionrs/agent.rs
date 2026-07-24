@@ -22,7 +22,7 @@ use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::agent_runtime::AgentRuntime;
 use crate::agent_task::IAgentTask;
@@ -37,6 +37,7 @@ use crate::types::{AionrsResolvedConfig, SendMessageData};
 
 use super::content::build_content_blocks;
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
+use super::provider_input_trace::create_provider_with_input_trace;
 
 fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
     let mut config =
@@ -208,8 +209,11 @@ impl AionrsAgentManager {
 
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
+        let provider = create_provider_with_input_trace(&config, conversation_id.clone());
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
+            .provider(provider)
+            .runtime_env(runtime_env);
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,
@@ -397,9 +401,17 @@ impl IAgentTask for AionrsAgentManager {
         );
 
         let mut engine = self.engine.lock().await;
+        let model_run = engine
+            .run_with_blocks(content_blocks, &data.msg_id)
+            .instrument(info_span!(
+                "aionrs_model_run",
+                conversation_id = %self.runtime.conversation_id(),
+                msg_id = %data.msg_id,
+                turn_id = data.turn_id.as_deref().unwrap_or("none"),
+            ));
 
         let result = tokio::select! {
-            res = engine.run_with_blocks(content_blocks, &data.msg_id) => Some(res),
+            res = model_run => Some(res),
             _ = self.cancel_notify.notified() => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
@@ -414,7 +426,16 @@ impl IAgentTask for AionrsAgentManager {
         self.runtime.bump_activity();
 
         let send_result = match result {
-            Some(Ok(_)) => {
+            Some(Ok(agent_result)) => {
+                info!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    turns = agent_result.turns,
+                    input_tokens = agent_result.usage.input_tokens,
+                    output_tokens = agent_result.usage.output_tokens,
+                    cache_creation_tokens = agent_result.usage.cache_creation_tokens,
+                    cache_read_tokens = agent_result.usage.cache_read_tokens,
+                    "Aionrs session usage"
+                );
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,

@@ -52,6 +52,12 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
     };
+    if config.dump_prompts {
+        // Read by the Aionrs provider tracing wrapper before each outbound request.
+        unsafe {
+            std::env::set_var("AIONUI_PROMPT_TRACE", "1");
+        }
+    }
     info!(
         "Running in {} mode — authentication is {}",
         if config.local { "local" } else { "remote" },

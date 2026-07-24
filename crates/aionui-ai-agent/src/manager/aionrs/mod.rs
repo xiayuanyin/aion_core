@@ -1,5 +1,6 @@
 mod content;
 mod error;
+mod provider_input_trace;
 
 pub mod agent;
 pub mod history_sanitize;
