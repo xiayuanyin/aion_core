@@ -143,6 +143,7 @@ pub enum ConversationSource {
     Lark,
     Dingtalk,
     Weixin,
+    Wecom,
 }
 
 /// Type discriminant for messages in a conversation.

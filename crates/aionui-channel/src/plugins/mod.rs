@@ -10,6 +10,9 @@ pub mod dingtalk;
 #[cfg(feature = "weixin")]
 pub mod weixin;
 
+#[cfg(feature = "wecom")]
+pub mod wecom;
+
 use crate::plugin::ChannelPlugin;
 use crate::types::PluginType;
 
@@ -29,6 +32,9 @@ pub fn create_plugin(plugin_type: PluginType) -> Option<Box<dyn ChannelPlugin>> 
 
         #[cfg(feature = "weixin")]
         PluginType::Weixin => Some(Box::new(weixin::WeixinPlugin::new())),
+
+        #[cfg(feature = "wecom")]
+        PluginType::Wecom => Some(Box::new(wecom::WecomPlugin::new())),
 
         #[allow(unreachable_patterns)]
         _ => None,

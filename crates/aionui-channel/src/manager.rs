@@ -13,6 +13,8 @@ use crate::error::ChannelError;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{PluginConfig, PluginStatus, PluginType, UnifiedIncomingMessage};
 
+type PluginStatusUpdate = (String, PluginStatus);
+
 /// Manages the lifecycle of channel plugins.
 ///
 /// Responsibilities:
@@ -35,6 +37,7 @@ pub struct ChannelManager {
     message_tx: mpsc::Sender<UnifiedIncomingMessage>,
     /// Sender for tool confirmation callbacks from all plugins.
     confirm_tx: mpsc::Sender<(String, String)>,
+    status_tx: mpsc::UnboundedSender<PluginStatusUpdate>,
 }
 
 /// Factory function type for creating plugin instances.
@@ -64,6 +67,62 @@ impl ChannelManager {
         message_tx: mpsc::Sender<UnifiedIncomingMessage>,
         confirm_tx: mpsc::Sender<(String, String)>,
     ) -> Self {
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel::<PluginStatusUpdate>();
+        let status_repo = repo.clone();
+        let status_broadcaster = broadcaster.clone();
+        let status_key = encryption_key;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                while let Some((plugin_id, status)) = status_rx.recv().await {
+                    let Ok(Some(row)) = status_repo.get_plugin(&plugin_id).await else {
+                        continue;
+                    };
+                    let has_token = if row.r#type == "wecom" {
+                        decrypt_string(&row.config, &status_key)
+                            .ok()
+                            .and_then(|json| serde_json::from_str::<PluginConfig>(&json).ok())
+                            .map(|config| {
+                                let bot_id = config
+                                    .credentials
+                                    .extra
+                                    .get("bot_id")
+                                    .and_then(serde_json::Value::as_str);
+                                let secret = config
+                                    .credentials
+                                    .extra
+                                    .get("secret")
+                                    .and_then(serde_json::Value::as_str)
+                                    .or(config.credentials.token.as_deref());
+                                bot_id.is_some_and(|v| !v.is_empty()) && secret.is_some_and(|v| !v.is_empty())
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        !row.config.is_empty()
+                    };
+                    let response = PluginStatusResponse {
+                        plugin_id: row.id.clone(),
+                        plugin_type: row.r#type.clone(),
+                        name: row.name.clone(),
+                        enabled: row.enabled,
+                        status: Some(status.to_string()),
+                        last_connected: row.last_connected,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                        connected: row.enabled && status == PluginStatus::Running,
+                        has_token,
+                        bot_username: None,
+                        active_users: 0,
+                    };
+                    let payload = PluginStatusChangedPayload {
+                        plugin_id,
+                        status: response,
+                    };
+                    if let Ok(value) = serde_json::to_value(payload) {
+                        status_broadcaster.broadcast(WebSocketMessage::new("channel.plugin-status-changed", value));
+                    }
+                }
+            });
+        }
         Self {
             repo,
             broadcaster,
@@ -71,6 +130,7 @@ impl ChannelManager {
             plugins: DashMap::new(),
             message_tx,
             confirm_tx,
+            status_tx,
         }
     }
 
@@ -147,9 +207,18 @@ impl ChannelManager {
         let mut plugin = factory(plugin_type)
             .ok_or_else(|| ChannelError::InvalidPluginType(format!("No implementation for {plugin_type}")))?;
 
+        let (plugin_status_tx, mut plugin_status_rx) = mpsc::unbounded_channel();
+        let status_forward_tx = self.status_tx.clone();
+        let status_plugin_id = plugin_id.to_owned();
+        tokio::spawn(async move {
+            while let Some(status) = plugin_status_rx.recv().await {
+                let _ = status_forward_tx.send((status_plugin_id.clone(), status));
+            }
+        });
         let callbacks = PluginCallbacks {
             message_tx: self.message_tx.clone(),
             confirm_tx: self.confirm_tx.clone(),
+            status_tx: plugin_status_tx,
         };
 
         if let Err(e) = plugin.initialize(config, callbacks).await {
@@ -263,6 +332,10 @@ impl ChannelManager {
         let callbacks = PluginCallbacks {
             message_tx: msg_tx,
             confirm_tx,
+            status_tx: {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                tx
+            },
         };
 
         plugin.initialize(config, callbacks).await?;
@@ -448,9 +521,18 @@ impl ChannelManager {
         let mut plugin = factory(plugin_type)
             .ok_or_else(|| ChannelError::InvalidPluginType(format!("No implementation for {plugin_type}")))?;
 
+        let (plugin_status_tx, mut plugin_status_rx) = mpsc::unbounded_channel();
+        let status_forward_tx = self.status_tx.clone();
+        let status_plugin_id = row.id.clone();
+        tokio::spawn(async move {
+            while let Some(status) = plugin_status_rx.recv().await {
+                let _ = status_forward_tx.send((status_plugin_id.clone(), status));
+            }
+        });
         let callbacks = PluginCallbacks {
             message_tx: self.message_tx.clone(),
             confirm_tx: self.confirm_tx.clone(),
+            status_tx: plugin_status_tx,
         };
 
         plugin.initialize(config, callbacks).await?;
@@ -525,8 +607,30 @@ impl ChannelManager {
 
     /// Converts a DB row + optional live status to a `PluginStatusResponse`.
     fn row_to_status_response(&self, row: &ChannelPluginRow, live_status: Option<String>) -> PluginStatusResponse {
-        let is_running = self.plugins.contains_key(&row.id);
-        let has_token = !row.config.is_empty();
+        let is_running = live_status.as_deref() == Some("running")
+            || (live_status.is_none() && row.status.as_deref() == Some("running"));
+        let has_token = if row.r#type == "wecom" {
+            decrypt_string(&row.config, &self.encryption_key)
+                .ok()
+                .and_then(|json| serde_json::from_str::<PluginConfig>(&json).ok())
+                .map(|config| {
+                    let bot_id = config
+                        .credentials
+                        .extra
+                        .get("bot_id")
+                        .and_then(serde_json::Value::as_str);
+                    let secret = config
+                        .credentials
+                        .extra
+                        .get("secret")
+                        .and_then(serde_json::Value::as_str)
+                        .or(config.credentials.token.as_deref());
+                    bot_id.is_some_and(|v| !v.is_empty()) && secret.is_some_and(|v| !v.is_empty())
+                })
+                .unwrap_or(false)
+        } else {
+            !row.config.is_empty()
+        };
         PluginStatusResponse {
             plugin_id: row.id.clone(),
             plugin_type: row.r#type.clone(),
@@ -550,6 +654,7 @@ impl ChannelManager {
             PluginType::Lark => "Lark Bot".into(),
             PluginType::Dingtalk => "DingTalk Bot".into(),
             PluginType::Weixin => "WeChat Bot".into(),
+            PluginType::Wecom => "WeCom AI Bot".into(),
             PluginType::Slack => "Slack Bot".into(),
             PluginType::Discord => "Discord Bot".into(),
         }

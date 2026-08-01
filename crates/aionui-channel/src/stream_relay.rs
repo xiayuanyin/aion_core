@@ -271,7 +271,7 @@ impl ChannelStreamRelay {
 /// before rendering silent/non-text events (tool calls etc.) to avoid either
 /// overwriting it with a tool-status indicator or deferring it until Finish.
 fn is_weixin_platform(platform: PluginType) -> bool {
-    matches!(platform, PluginType::Weixin)
+    matches!(platform, PluginType::Weixin | PluginType::Wecom)
 }
 
 // ── Test helpers (pub so integration tests can use them) ─────────

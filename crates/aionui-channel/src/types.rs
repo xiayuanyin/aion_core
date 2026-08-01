@@ -18,6 +18,7 @@ pub enum PluginType {
     Lark,
     Dingtalk,
     Weixin,
+    Wecom,
     /// Reserved variant for future Slack integration.
     Slack,
     /// Reserved variant for future Discord integration.
@@ -31,6 +32,7 @@ impl fmt::Display for PluginType {
             Self::Lark => write!(f, "lark"),
             Self::Dingtalk => write!(f, "dingtalk"),
             Self::Weixin => write!(f, "weixin"),
+            Self::Wecom => write!(f, "wecom"),
             Self::Slack => write!(f, "slack"),
             Self::Discord => write!(f, "discord"),
         }
@@ -45,6 +47,7 @@ impl PluginType {
             "lark" => Some(Self::Lark),
             "dingtalk" => Some(Self::Dingtalk),
             "weixin" => Some(Self::Weixin),
+            "wecom" => Some(Self::Wecom),
             "slack" => Some(Self::Slack),
             "discord" => Some(Self::Discord),
             _ => None,
@@ -158,6 +161,7 @@ impl PairingStatus {
 /// - Lark: `app_id` + `app_secret` + optional `encrypt_key`/`verification_token`
 /// - DingTalk: `client_id` + `client_secret`
 /// - WeChat: `account_id` + `bot_token`
+/// - WeCom AI Bot: `extra.bot_id` + `extra.secret` (or `token` as secret)
 ///
 /// Remaining fields are captured in `extra` for extensibility
 /// (API Spec `[key: string]: unknown`).
@@ -490,6 +494,7 @@ mod tests {
             (PluginType::Lark, "\"lark\""),
             (PluginType::Dingtalk, "\"dingtalk\""),
             (PluginType::Weixin, "\"weixin\""),
+            (PluginType::Wecom, "\"wecom\""),
             (PluginType::Slack, "\"slack\""),
             (PluginType::Discord, "\"discord\""),
         ];
@@ -507,6 +512,7 @@ mod tests {
         assert_eq!(PluginType::Lark.to_string(), "lark");
         assert_eq!(PluginType::Dingtalk.to_string(), "dingtalk");
         assert_eq!(PluginType::Weixin.to_string(), "weixin");
+        assert_eq!(PluginType::Wecom.to_string(), "wecom");
         assert_eq!(PluginType::Slack.to_string(), "slack");
         assert_eq!(PluginType::Discord.to_string(), "discord");
     }
@@ -515,6 +521,7 @@ mod tests {
     fn plugin_type_from_str_opt() {
         assert_eq!(PluginType::from_str_opt("telegram"), Some(PluginType::Telegram));
         assert_eq!(PluginType::from_str_opt("lark"), Some(PluginType::Lark));
+        assert_eq!(PluginType::from_str_opt("wecom"), Some(PluginType::Wecom));
         assert_eq!(PluginType::from_str_opt("unknown"), None);
     }
 

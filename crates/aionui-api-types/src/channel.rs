@@ -44,6 +44,8 @@ pub struct TestPluginExtraConfig {
     #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
+    pub bot_id: Option<String>,
+    #[serde(default)]
     pub app_secret: Option<String>,
 }
 

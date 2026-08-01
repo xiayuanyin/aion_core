@@ -15,6 +15,8 @@ pub struct PluginCallbacks {
     pub message_tx: tokio::sync::mpsc::Sender<UnifiedIncomingMessage>,
     /// Sender for tool confirmation callbacks (callId, value).
     pub confirm_tx: tokio::sync::mpsc::Sender<(String, String)>,
+    /// Sender for lifecycle changes observed by a background connection task.
+    pub status_tx: tokio::sync::mpsc::UnboundedSender<PluginStatus>,
 }
 
 /// Abstraction over a platform-specific channel plugin.
@@ -190,7 +192,12 @@ mod tests {
     fn make_test_callbacks() -> PluginCallbacks {
         let (message_tx, _message_rx) = mpsc::channel(16);
         let (confirm_tx, _confirm_rx) = mpsc::channel(16);
-        PluginCallbacks { message_tx, confirm_tx }
+        let (status_tx, _status_rx) = tokio::sync::mpsc::unbounded_channel();
+        PluginCallbacks {
+            message_tx,
+            confirm_tx,
+            status_tx,
+        }
     }
 
     fn make_test_outgoing() -> UnifiedOutgoingMessage {

@@ -717,6 +717,16 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
                 credentials.account_id = extra.app_id.clone();
             }
         }
+        "wecom" => {
+            credentials.token = Some(req.token.clone());
+            if let Some(ref extra) = req.extra_config
+                && let Some(bot_id) = extra.bot_id.clone().or_else(|| extra.app_id.clone())
+            {
+                credentials
+                    .extra
+                    .insert("bot_id".into(), serde_json::Value::String(bot_id));
+            }
+        }
         _ => {
             // Default: use token field (Telegram)
             credentials.token = Some(req.token.clone());
@@ -952,6 +962,7 @@ mod tests {
             token: "xxx".into(),
             extra_config: Some(TestPluginExtraConfig {
                 app_id: Some("cli_abc".into()),
+                bot_id: None,
                 app_secret: Some("secret".into()),
             }),
         };
@@ -968,6 +979,7 @@ mod tests {
             token: "client_id_123".into(),
             extra_config: Some(TestPluginExtraConfig {
                 app_id: None,
+                bot_id: None,
                 app_secret: Some("client_secret_456".into()),
             }),
         };
@@ -983,11 +995,28 @@ mod tests {
             token: "bot_token_xyz".into(),
             extra_config: Some(TestPluginExtraConfig {
                 app_id: Some("account_abc".into()),
+                bot_id: None,
                 app_secret: None,
             }),
         };
         let config = build_test_config(&req);
         assert_eq!(config.credentials.bot_token.as_deref(), Some("bot_token_xyz"));
         assert_eq!(config.credentials.account_id.as_deref(), Some("account_abc"));
+    }
+
+    #[test]
+    fn build_test_config_wecom_uses_token_as_secret_and_app_id_as_bot_id() {
+        let req = TestPluginRequest {
+            plugin_id: "wecom".into(),
+            token: "secret_value".into(),
+            extra_config: Some(TestPluginExtraConfig {
+                app_id: Some("bot_id_value".into()),
+                bot_id: None,
+                app_secret: None,
+            }),
+        };
+        let config = build_test_config(&req);
+        assert_eq!(config.credentials.token.as_deref(), Some("secret_value"));
+        assert_eq!(config.credentials.extra["bot_id"], serde_json::json!("bot_id_value"));
     }
 }

@@ -565,6 +565,11 @@ mod tests {
     fn make_callbacks() -> PluginCallbacks {
         let (message_tx, _) = tokio::sync::mpsc::channel(16);
         let (confirm_tx, _) = tokio::sync::mpsc::channel(16);
-        PluginCallbacks { message_tx, confirm_tx }
+        let (status_tx, _status_rx) = tokio::sync::mpsc::unbounded_channel();
+        PluginCallbacks {
+            message_tx,
+            confirm_tx,
+            status_tx,
+        }
     }
 }
