@@ -261,7 +261,7 @@ async fn send_msg(
     let Json(req) = body.map_err(ApiError::from)?;
     let response = state
         .service
-        .send_message(&user.id, &id, req, &state.task_manager)
+        .send_message_with_external_reply(&user.id, &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))

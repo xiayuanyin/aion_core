@@ -54,6 +54,20 @@ pub trait ChannelPlugin: Send + Sync {
     /// Send a message to a specific chat. Returns the platform message ID.
     async fn send_message(&self, chat_id: &str, message: UnifiedOutgoingMessage) -> Result<String, ChannelError>;
 
+    /// Sends a message without requiring a preceding inbound callback.
+    ///
+    /// Platforms that do not expose an active-push API reject this operation
+    /// explicitly. WeCom overrides it with `aibot_send_msg`.
+    async fn send_active_message(
+        &self,
+        _chat_id: &str,
+        _message: UnifiedOutgoingMessage,
+    ) -> Result<String, ChannelError> {
+        Err(ChannelError::PlatformApi(
+            "Active channel messages are not supported".into(),
+        ))
+    }
+
     /// Edit an existing message on the platform.
     ///
     /// Platforms that don't support editing (e.g., WeChat) may implement

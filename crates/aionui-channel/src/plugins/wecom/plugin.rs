@@ -12,8 +12,8 @@ use tracing::{debug, warn};
 use crate::error::ChannelError;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{
-    BotInfo, MessageContentType, PluginConfig, PluginStatus, PluginType, UnifiedIncomingMessage, UnifiedMessageContent,
-    UnifiedOutgoingMessage, UnifiedUser,
+    ActionButton, BotInfo, MessageContentType, OutgoingMessageType, PluginConfig, PluginStatus, PluginType,
+    UnifiedAttachment, UnifiedIncomingMessage, UnifiedMessageContent, UnifiedOutgoingMessage, UnifiedUser,
 };
 
 const WS_URL: &str = "wss://openws.work.weixin.qq.com";
@@ -26,7 +26,11 @@ const MAX_DEDUP_ENTRIES: usize = 2048;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct Outbound {
+    chat_id: String,
     req_id: String,
+    force_active: bool,
+    /// Existing stream id when this is a refresh through `edit_message`.
+    stream_id: Option<String>,
     message: UnifiedOutgoingMessage,
     result: oneshot::Sender<Result<String, ChannelError>>,
 }
@@ -37,6 +41,11 @@ struct PendingOutbound {
     stream_id: String,
 }
 
+#[derive(Clone)]
+struct RequestContext {
+    req_id: String,
+}
+
 struct ConnectionContext {
     bot_id: String,
     secret: String,
@@ -44,6 +53,7 @@ struct ConnectionContext {
     callbacks: PluginCallbacks,
     status: Arc<AtomicU8>,
     last_error: Arc<Mutex<Option<String>>>,
+    welcome_message: Option<String>,
 }
 
 /// Enterprise WeCom AI Bot long-connection plugin.
@@ -58,6 +68,7 @@ pub struct WecomPlugin {
     out_tx: Option<mpsc::Sender<Outbound>>,
     ws_handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<watch::Sender<bool>>,
+    welcome_message: Option<String>,
 }
 
 impl Default for WecomPlugin {
@@ -73,6 +84,7 @@ impl Default for WecomPlugin {
             out_tx: None,
             ws_handle: None,
             shutdown_tx: None,
+            welcome_message: None,
         }
     }
 }
@@ -85,6 +97,52 @@ impl WecomPlugin {
     fn set_status(&self, status: PluginStatus, callbacks: &mpsc::UnboundedSender<PluginStatus>) {
         self.status.store(status_code(status), Ordering::Release);
         let _ = callbacks.send(status);
+    }
+
+    /// Sends an `aibot_send_msg` push without requiring a preceding callback.
+    /// The platform still requires that the user has previously contacted the bot.
+    pub async fn send_active_message(
+        &self,
+        chat_id: &str,
+        message: UnifiedOutgoingMessage,
+    ) -> Result<String, ChannelError> {
+        self.enqueue_outbound(chat_id, message, true).await
+    }
+
+    async fn enqueue_outbound(
+        &self,
+        chat_id: &str,
+        message: UnifiedOutgoingMessage,
+        force_active: bool,
+    ) -> Result<String, ChannelError> {
+        let request = latest_request(chat_id);
+        let req_id = if force_active {
+            next_id("send")
+        } else {
+            request
+                .as_ref()
+                .map(|request| request.req_id.clone())
+                .unwrap_or_else(|| next_id("send"))
+        };
+        let out_tx = self
+            .out_tx
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("WeCom plugin is not connected".into()))?;
+        let (result_tx, result_rx) = oneshot::channel();
+        out_tx
+            .send(Outbound {
+                chat_id: chat_id.to_owned(),
+                req_id,
+                force_active,
+                stream_id: None,
+                message,
+                result: result_tx,
+            })
+            .await
+            .map_err(|_| ChannelError::MessageSendFailed("WeCom connection is stopping".into()))?;
+        result_rx
+            .await
+            .map_err(|_| ChannelError::MessageSendFailed("WeCom send task stopped".into()))?
     }
 }
 
@@ -129,6 +187,14 @@ impl ChannelPlugin for WecomPlugin {
             })
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
+        self.welcome_message = config
+            .config
+            .as_ref()
+            .and_then(|options| options.extra.get("welcome_message"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
         let status_tx = callbacks.status_tx.clone();
         self.callbacks = Some(callbacks);
         self.set_status(PluginStatus::Ready, &status_tx);
@@ -166,6 +232,7 @@ impl ChannelPlugin for WecomPlugin {
             callbacks,
             status: Arc::clone(&self.status),
             last_error: Arc::clone(&self.last_error),
+            welcome_message: self.welcome_message.clone(),
         };
         self.ws_handle = Some(tokio::spawn(connection_loop(context, out_rx, shutdown_rx)));
         Ok(())
@@ -190,8 +257,28 @@ impl ChannelPlugin for WecomPlugin {
     }
 
     async fn send_message(&self, chat_id: &str, message: UnifiedOutgoingMessage) -> Result<String, ChannelError> {
-        let req_id = latest_req_id(chat_id)
-            .ok_or_else(|| ChannelError::MessageSendFailed("WeCom reply has no inbound request context".into()))?;
+        self.enqueue_outbound(chat_id, message, false).await
+    }
+
+    async fn send_active_message(
+        &self,
+        chat_id: &str,
+        message: UnifiedOutgoingMessage,
+    ) -> Result<String, ChannelError> {
+        self.enqueue_outbound(chat_id, message, true).await
+    }
+
+    async fn edit_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        message: UnifiedOutgoingMessage,
+    ) -> Result<(), ChannelError> {
+        let request = latest_request(chat_id);
+        let req_id = request
+            .as_ref()
+            .map(|request| request.req_id.clone())
+            .unwrap_or_else(|| next_id("send"));
         let out_tx = self
             .out_tx
             .as_ref()
@@ -199,24 +286,18 @@ impl ChannelPlugin for WecomPlugin {
         let (result_tx, result_rx) = oneshot::channel();
         out_tx
             .send(Outbound {
+                chat_id: chat_id.to_owned(),
                 req_id,
+                force_active: false,
+                stream_id: Some(message_id.to_owned()),
                 message,
                 result: result_tx,
             })
             .await
             .map_err(|_| ChannelError::MessageSendFailed("WeCom connection is stopping".into()))?;
-        result_rx
+        let _ = result_rx
             .await
-            .map_err(|_| ChannelError::MessageSendFailed("WeCom send task stopped".into()))?
-    }
-
-    async fn edit_message(
-        &self,
-        chat_id: &str,
-        _message_id: &str,
-        message: UnifiedOutgoingMessage,
-    ) -> Result<(), ChannelError> {
-        let _ = self.send_message(chat_id, message).await?;
+            .map_err(|_| ChannelError::MessageSendFailed("WeCom send task stopped".into()))??;
         Ok(())
     }
 
@@ -335,7 +416,8 @@ async fn connect_once(
             }
             outbound = out_rx.recv() => {
                 if let Some(outbound) = outbound {
-                    let result = send_outbound(&mut write, &outbound).await;
+                    let request = (!outbound.force_active).then(|| latest_request(&outbound.chat_id)).flatten();
+                    let result = send_outbound(&mut write, &outbound, request).await;
                     match result {
                         Ok(stream_id) => {
                             pending.entry(outbound.req_id).or_default().push(PendingOutbound {
@@ -399,10 +481,13 @@ async fn connect_once(
                             continue;
                         }
                         let cmd = frame.get("cmd").and_then(serde_json::Value::as_str).unwrap_or("");
-                        if (cmd == "aibot_msg_callback" || cmd == "aibot_event_callback") && authenticated
-                            && let Some(message) = parse_incoming(&frame, &mut seen) {
-                            remember_req_id(&message.chat_id, req_id);
-                            let _ = context.callbacks.message_tx.send(message).await;
+                        if (cmd == "aibot_msg_callback" || cmd == "aibot_event_callback") && authenticated {
+                            if let Some(message) = parse_incoming(&frame, &mut seen) {
+                                remember_request(&message.chat_id, req_id);
+                                let _ = context.callbacks.message_tx.send(message).await;
+                            } else if cmd == "aibot_event_callback" && mark_event_seen(&frame, &mut seen) {
+                                handle_event_callback(&mut write, context, &frame, req_id).await?;
+                            }
                         }
                     }
                     Some(Ok(WsMessage::Ping(data))) => { let _ = write.send(WsMessage::Pong(data)).await; }
@@ -437,56 +522,107 @@ fn expire_pending(pending: &mut HashMap<String, Vec<PendingOutbound>>) {
     }
 }
 
-async fn send_outbound<S>(write: &mut S, outbound: &Outbound) -> Result<String, ChannelError>
+async fn send_outbound<S>(
+    write: &mut S,
+    outbound: &Outbound,
+    request: Option<RequestContext>,
+) -> Result<String, ChannelError>
 where
     S: futures_util::Sink<WsMessage> + Unpin,
     <S as futures_util::Sink<WsMessage>>::Error: std::fmt::Display,
 {
     let text = outbound.message.text.as_deref().unwrap_or("");
-    let chunks = split_text(text, MAX_MESSAGE_CHARS);
-    let stream_id = next_id("stream");
-    for (index, chunk) in chunks.iter().enumerate() {
-        let finish = index + 1 == chunks.len();
-        let body = if outbound.message.parse_mode.is_some() {
-            serde_json::json!({"msgtype":"markdown", "markdown":{"content":chunk}})
-        } else {
-            serde_json::json!({"msgtype":"stream", "stream":{"id":stream_id,"finish":finish,"content":chunk}})
-        };
+    let stream_id = outbound.stream_id.clone().unwrap_or_else(|| next_id("stream"));
+    if request.is_none() {
+        let body = active_push_body(&message_body(&outbound.message)?, &outbound.message, &outbound.chat_id);
         let frame = serde_json::json!({
-            "cmd": "aibot_respond_msg", "headers": {"req_id": outbound.req_id},
-            "body": body
+            "cmd": "aibot_send_msg",
+            "headers": {"req_id": outbound.req_id},
+            "body": body,
+        });
+        write
+            .send(WsMessage::Text(frame.to_string().into()))
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(format!("WeCom response send failed: {error}")))?;
+    } else if outbound.stream_id.is_some()
+        || matches!(
+            outbound.message.message_type,
+            crate::types::OutgoingMessageType::Text | crate::types::OutgoingMessageType::Buttons
+        )
+    {
+        let chunks = split_text(text, MAX_MESSAGE_CHARS);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let finish = index + 1 == chunks.len();
+            let body = if outbound.message.parse_mode.is_some() {
+                serde_json::json!({"msgtype":"markdown", "markdown":{"content":chunk}})
+            } else {
+                serde_json::json!({"msgtype":"stream", "stream":{"id":stream_id,"finish":finish,"content":chunk}})
+            };
+            let frame = serde_json::json!({
+                "cmd": "aibot_respond_msg",
+                "headers": {"req_id": outbound.req_id},
+                "body": body,
+            });
+            write
+                .send(WsMessage::Text(frame.to_string().into()))
+                .await
+                .map_err(|error| ChannelError::MessageSendFailed(format!("WeCom response send failed: {error}")))?;
+        }
+    } else {
+        let body = message_body(&outbound.message)?;
+        let frame = serde_json::json!({
+            "cmd": "aibot_respond_msg", "headers": {"req_id": outbound.req_id}, "body": body
         });
         write
             .send(WsMessage::Text(frame.to_string().into()))
             .await
             .map_err(|error| ChannelError::MessageSendFailed(format!("WeCom response send failed: {error}")))?;
     }
-    Ok(stream_id)
+    Ok(if outbound.force_active {
+        outbound.req_id.clone()
+    } else {
+        stream_id
+    })
 }
 
 fn parse_incoming(frame: &serde_json::Value, seen: &mut HashMap<String, Instant>) -> Option<UnifiedIncomingMessage> {
     let body = frame.get("body")?;
     let msgid = body.get("msgid")?.as_str()?.to_owned();
-    let now = Instant::now();
-    seen.retain(|_, value| now.duration_since(*value) < Duration::from_secs(3600));
-    if seen.insert(msgid.clone(), now).is_some() {
+    let msgtype = body.get("msgtype").and_then(serde_json::Value::as_str).unwrap_or("");
+    if msgtype != "event" && !mark_event_seen(frame, seen) {
         return None;
     }
-    if seen.len() > MAX_DEDUP_ENTRIES
-        && let Some(key) = seen.keys().next().cloned()
-    {
-        seen.remove(&key);
-    }
-    let msgtype = body.get("msgtype").and_then(serde_json::Value::as_str).unwrap_or("");
-    let text = match msgtype {
-        "text" => body
-            .pointer("/text/content")
-            .and_then(serde_json::Value::as_str)?
-            .to_owned(),
-        "voice" => body
-            .pointer("/voice/content")
-            .and_then(serde_json::Value::as_str)?
-            .to_owned(),
+    let (text, attachments, content_type) = match msgtype {
+        "text" => (
+            body.pointer("/text/content")
+                .and_then(serde_json::Value::as_str)?
+                .to_owned(),
+            None,
+            MessageContentType::Text,
+        ),
+        "voice" => (
+            body.pointer("/voice/content")
+                .and_then(serde_json::Value::as_str)?
+                .to_owned(),
+            None,
+            MessageContentType::Voice,
+        ),
+        "image" => (
+            "[图片]".into(),
+            media_attachment(body, "image", "image/*"),
+            MessageContentType::Photo,
+        ),
+        "file" => (
+            "[文件]".into(),
+            media_attachment(body, "file", "application/octet-stream"),
+            MessageContentType::Document,
+        ),
+        "video" => (
+            "[视频]".into(),
+            media_attachment(body, "video", "video/*"),
+            MessageContentType::Video,
+        ),
+        "mixed" => parse_mixed(body)?,
         _ => return None,
     };
     let userid = body
@@ -521,15 +657,178 @@ fn parse_incoming(frame: &serde_json::Value, seen: &mut HashMap<String, Instant>
             avatar_url: None,
         },
         content: UnifiedMessageContent {
-            content_type: MessageContentType::Text,
+            content_type,
             text,
-            attachments: None,
+            attachments,
         },
         timestamp,
         reply_to_message_id: None,
         action: None,
         raw: Some(frame.clone()),
     })
+}
+
+fn mark_event_seen(frame: &serde_json::Value, seen: &mut HashMap<String, Instant>) -> bool {
+    let Some(msgid) = frame.pointer("/body/msgid").and_then(serde_json::Value::as_str) else {
+        return true;
+    };
+    let now = Instant::now();
+    seen.retain(|_, value| now.duration_since(*value) < Duration::from_secs(3600));
+    if seen.insert(msgid.to_owned(), now).is_some() {
+        return false;
+    }
+    if seen.len() > MAX_DEDUP_ENTRIES
+        && let Some(key) = seen.keys().next().cloned()
+    {
+        seen.remove(&key);
+    }
+    true
+}
+
+fn media_attachment(body: &serde_json::Value, kind: &str, mime_type: &str) -> Option<Vec<UnifiedAttachment>> {
+    let media = body.get(kind)?;
+    let url = media.get("url").and_then(serde_json::Value::as_str)?.to_owned();
+    Some(vec![UnifiedAttachment {
+        file_id: media
+            .get("media_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        file_name: None,
+        mime_type: Some(mime_type.into()),
+        file_size: media.get("filesize").and_then(serde_json::Value::as_u64),
+        url: Some(url),
+    }])
+}
+
+fn parse_mixed(body: &serde_json::Value) -> Option<(String, Option<Vec<UnifiedAttachment>>, MessageContentType)> {
+    let items = body.pointer("/mixed/msg_item")?.as_array()?;
+    let mut text = String::new();
+    let mut attachments = Vec::new();
+    for item in items {
+        match item.get("msgtype").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                if let Some(value) = item.pointer("/text/content").and_then(serde_json::Value::as_str) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(value);
+                }
+            }
+            Some("image") => {
+                if let Some(mut values) = media_attachment(item, "image", "image/*") {
+                    attachments.append(&mut values);
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str("[图片]");
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((
+        text,
+        (!attachments.is_empty()).then_some(attachments),
+        MessageContentType::Text,
+    ))
+}
+
+fn message_body(message: &UnifiedOutgoingMessage) -> Result<serde_json::Value, ChannelError> {
+    match message.message_type {
+        OutgoingMessageType::Image => {
+            let media_id = message
+                .image_url
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ChannelError::MessageSendFailed("WeCom image message requires image_url as media_id".into())
+                })?;
+            Ok(serde_json::json!({"msgtype":"image", "image":{"media_id":media_id}}))
+        }
+        OutgoingMessageType::File => {
+            let media_id = message
+                .file_url
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ChannelError::MessageSendFailed("WeCom file message requires file_url as media_id".into())
+                })?;
+            Ok(serde_json::json!({"msgtype":"file", "file":{"media_id":media_id}}))
+        }
+        OutgoingMessageType::Buttons => {
+            let buttons = message
+                .buttons
+                .as_ref()
+                .or(message.keyboard.as_ref())
+                .ok_or_else(|| ChannelError::MessageSendFailed("WeCom template card requires buttons".into()))?;
+            Ok(template_card_body(message.text.as_deref().unwrap_or(""), buttons))
+        }
+        OutgoingMessageType::Text => {
+            let content = message.text.as_deref().unwrap_or(" ");
+            Ok(serde_json::json!({"msgtype":"markdown", "markdown":{"content":content}}))
+        }
+    }
+}
+
+fn template_card_body(title: &str, rows: &[Vec<ActionButton>]) -> serde_json::Value {
+    let button_list: Vec<serde_json::Value> = rows
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|button| {
+            serde_json::json!({
+                "text": button.label,
+                "style": if button.action.starts_with("pairing.") { 1 } else { 2 },
+                "key": button.action,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "msgtype":"template_card",
+        "template_card": {
+            "card_type":"button_interaction",
+            "main_title":{"title":title},
+            "button_list":button_list,
+            "task_id": next_id("card"),
+        }
+    })
+}
+
+fn active_push_body(body: &serde_json::Value, _message: &UnifiedOutgoingMessage, chat_id: &str) -> serde_json::Value {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.insert("chatid".into(), serde_json::Value::String(chat_id.into()));
+        object.insert("chat_type".into(), serde_json::json!(0));
+    }
+    body
+}
+
+async fn handle_event_callback<S>(
+    write: &mut S,
+    context: &ConnectionContext,
+    frame: &serde_json::Value,
+    req_id: &str,
+) -> Result<(), ChannelError>
+where
+    S: futures_util::Sink<WsMessage> + Unpin,
+    <S as futures_util::Sink<WsMessage>>::Error: std::fmt::Display,
+{
+    let event_type = frame
+        .pointer("/body/event/eventtype")
+        .and_then(serde_json::Value::as_str);
+    if event_type == Some("enter_chat")
+        && let Some(content) = context.welcome_message.as_deref()
+    {
+        let response = serde_json::json!({
+            "cmd":"aibot_respond_welcome_msg",
+            "headers":{"req_id":req_id},
+            "body":{"msgtype":"text","text":{"content":content}},
+        });
+        write
+            .send(WsMessage::Text(response.to_string().into()))
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(format!("WeCom welcome reply failed: {error}")))?;
+    }
+    Ok(())
 }
 
 fn split_text(text: &str, max: usize) -> Vec<String> {
@@ -569,16 +868,19 @@ fn status_from_code(code: u8) -> PluginStatus {
     }
 }
 
-fn remember_req_id(chat_id: &str, req_id: &str) {
+fn remember_request(chat_id: &str, req_id: &str) {
     if !req_id.is_empty() {
-        request_map().lock().unwrap().insert(chat_id.into(), req_id.into());
+        request_map()
+            .lock()
+            .unwrap()
+            .insert(chat_id.into(), RequestContext { req_id: req_id.into() });
     }
 }
-fn latest_req_id(chat_id: &str) -> Option<String> {
+fn latest_request(chat_id: &str) -> Option<RequestContext> {
     request_map().lock().unwrap().get(chat_id).cloned()
 }
-fn request_map() -> &'static Mutex<HashMap<String, String>> {
-    static MAP: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+fn request_map() -> &'static Mutex<HashMap<String, RequestContext>> {
+    static MAP: std::sync::OnceLock<Mutex<HashMap<String, RequestContext>>> = std::sync::OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -602,7 +904,7 @@ fn tls_connector() -> Result<tokio_tungstenite::Connector, ChannelError> {
 mod tests {
     use super::*;
     use crate::plugin::PluginCallbacks;
-    use crate::types::PluginCredentials;
+    use crate::types::{PluginConfigOptions, PluginCredentials};
     use futures_util::{SinkExt, StreamExt};
     use std::collections::HashMap;
     use tokio::net::TcpListener;
@@ -690,6 +992,7 @@ mod tests {
             },
             status: Arc::new(AtomicU8::new(status_code(PluginStatus::Starting))),
             last_error: Arc::new(Mutex::new(None)),
+            welcome_message: None,
         }
     }
 
@@ -746,6 +1049,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replies_to_callback_with_same_req_id_and_stream_id() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let Some(Ok(WsMessage::Text(subscribe))) = socket.next().await else {
+                return;
+            };
+            let subscribe: serde_json::Value = serde_json::from_str(&subscribe).unwrap();
+            let subscribe_req_id = subscribe["headers"]["req_id"].as_str().unwrap();
+            socket
+                .send(WsMessage::Text(
+                    serde_json::json!({
+                        "cmd": "aibot_subscribe",
+                        "headers": {"req_id": subscribe_req_id},
+                        "errcode": 0,
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(WsMessage::Text(
+                    serde_json::json!({
+                        "cmd": "aibot_msg_callback",
+                        "headers": {"req_id": "callback-req-1"},
+                        "body": {
+                            "msgid": "callback-msg-1",
+                            "chatid": "chat-1",
+                            "chattype": "single",
+                            "from": {"userid": "user-1"},
+                            "msgtype": "text",
+                            "text": {"content": "hello"}
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let Some(Ok(WsMessage::Text(first_reply))) = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+            else {
+                return;
+            };
+            let first_reply: serde_json::Value = serde_json::from_str(&first_reply).unwrap();
+            assert_eq!(first_reply["cmd"], "aibot_respond_msg");
+            assert_eq!(first_reply["headers"]["req_id"], "callback-req-1");
+            assert_eq!(first_reply["body"]["msgtype"], "stream");
+            assert_eq!(first_reply["body"]["stream"]["finish"], false);
+            let stream_id = first_reply["body"]["stream"]["id"].as_str().unwrap();
+            assert!(!stream_id.is_empty());
+            let Some(Ok(WsMessage::Text(last_reply))) = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+            else {
+                return;
+            };
+            let last_reply: serde_json::Value = serde_json::from_str(&last_reply).unwrap();
+            assert_eq!(last_reply["cmd"], "aibot_respond_msg");
+            assert_eq!(last_reply["headers"]["req_id"], "callback-req-1");
+            assert_eq!(last_reply["body"]["stream"]["id"], stream_id);
+            assert_eq!(last_reply["body"]["stream"]["finish"], true);
+            socket
+                .send(WsMessage::Text(
+                    serde_json::json!({
+                        "headers": {"req_id": "callback-req-1"},
+                        "errcode": 0,
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.next().await;
+        });
+
+        let (message_tx, mut message_rx) = mpsc::channel(1);
+        let (confirm_tx, _) = mpsc::channel(1);
+        let (status_tx, _) = mpsc::unbounded_channel();
+        let callbacks = PluginCallbacks {
+            message_tx,
+            confirm_tx,
+            status_tx,
+        };
+        let mut plugin_config = config(Some("bot"), Some("secret"));
+        plugin_config.config = Some(PluginConfigOptions {
+            mode: None,
+            webhook_url: None,
+            rate_limit: None,
+            require_mention: None,
+            extra: HashMap::from([(
+                String::from("websocket_url"),
+                serde_json::json!(format!("ws://{address}")),
+            )]),
+        });
+        let mut plugin = WecomPlugin::new();
+        plugin.initialize(plugin_config, callbacks).await.unwrap();
+        plugin.start().await.unwrap();
+
+        let incoming = tokio::time::timeout(Duration::from_secs(2), message_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(incoming.chat_id, "chat-1");
+        assert_eq!(incoming.content.text, "hello");
+        let message = UnifiedOutgoingMessage {
+            message_type: OutgoingMessageType::Buttons,
+            text: Some(format!("{}tail", "x".repeat(MAX_MESSAGE_CHARS))),
+            parse_mode: None,
+            buttons: Some(vec![vec![ActionButton {
+                label: "Regenerate".into(),
+                action: "chat.regenerate".into(),
+                params: None,
+            }]]),
+            keyboard: None,
+            image_url: None,
+            file_url: None,
+            file_name: None,
+            media_actions: None,
+            reply_to_message_id: None,
+            silent: None,
+        };
+        assert!(plugin.send_message("chat-1", message).await.is_ok());
+        plugin.stop().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn authentication_failure_is_reported_without_running_status() {
         let (ws_url, server) = mock_subscription_server(40001).await;
         let (status_tx, mut status_rx) = mpsc::unbounded_channel();
@@ -779,6 +1215,81 @@ mod tests {
         assert_eq!(message.user.display_name, "Alice");
         assert_eq!(message.timestamp, 1_700_000_000_000);
         assert!(parse_incoming(&frame, &mut seen).is_none());
+    }
+
+    #[test]
+    fn parses_media_and_mixed_messages_into_attachments() {
+        let image = serde_json::json!({
+            "cmd":"aibot_msg_callback",
+            "body": {
+                "msgid":"image-1", "chattype":"single", "from":{"userid":"u1"},
+                "msgtype":"image", "image":{"url":"https://example.test/image","aeskey":"key"}
+            }
+        });
+        let mut seen = HashMap::new();
+        let message = parse_incoming(&image, &mut seen).unwrap();
+        assert_eq!(message.content.content_type, MessageContentType::Photo);
+        assert_eq!(
+            message.content.attachments.as_ref().unwrap()[0].url.as_deref(),
+            Some("https://example.test/image")
+        );
+        assert_eq!(message.content.text, "[图片]");
+
+        let mixed = serde_json::json!({
+            "cmd":"aibot_msg_callback",
+            "body": {
+                "msgid":"mixed-1", "chatid":"group-1", "from":{"userid":"u1"},
+                "msgtype":"mixed", "mixed":{"msg_item":[
+                    {"msgtype":"text", "text":{"content":"hello"}},
+                    {"msgtype":"image", "image":{"url":"https://example.test/image"}}
+                ]}
+            }
+        });
+        let message = parse_incoming(&mixed, &mut seen).unwrap();
+        assert_eq!(message.chat_id, "group-1");
+        assert_eq!(message.content.text, "hello\n[图片]");
+        assert_eq!(message.content.attachments.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn builds_wecom_media_and_template_card_bodies() {
+        let image = UnifiedOutgoingMessage {
+            message_type: OutgoingMessageType::Image,
+            text: None,
+            parse_mode: None,
+            buttons: None,
+            keyboard: None,
+            image_url: Some("MEDIA_IMAGE".into()),
+            file_url: None,
+            file_name: None,
+            media_actions: None,
+            reply_to_message_id: None,
+            silent: None,
+        };
+        assert_eq!(message_body(&image).unwrap()["image"]["media_id"], "MEDIA_IMAGE");
+
+        let card = UnifiedOutgoingMessage {
+            message_type: OutgoingMessageType::Buttons,
+            text: Some("Choose".into()),
+            parse_mode: None,
+            buttons: Some(vec![vec![ActionButton {
+                label: "Yes".into(),
+                action: "confirm".into(),
+                params: None,
+            }]]),
+            keyboard: None,
+            image_url: None,
+            file_url: None,
+            file_name: None,
+            media_actions: None,
+            reply_to_message_id: None,
+            silent: None,
+        };
+        let body = message_body(&card).unwrap();
+        assert_eq!(body["msgtype"], "template_card");
+        assert_eq!(body["template_card"]["button_list"][0]["key"], "confirm");
+        assert!(!body["template_card"]["task_id"].as_str().unwrap().is_empty());
+        assert_eq!(active_push_body(&body, &card, "chat-1")["chatid"], "chat-1");
     }
 
     #[test]

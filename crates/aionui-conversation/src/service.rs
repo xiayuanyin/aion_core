@@ -53,6 +53,7 @@ use crate::error::ConversationError;
 use crate::session_context::SessionContextBuilder;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
+use crate::stream_relay::{ExternalConversationReplySender, ExternalReplyTarget};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
 
@@ -318,6 +319,7 @@ pub struct ConversationService {
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
+    external_reply_sender: Arc<RwLock<Option<Arc<dyn ExternalConversationReplySender>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -391,6 +393,7 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
+            external_reply_sender: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -459,6 +462,22 @@ impl ConversationService {
         if let Ok(mut guard) = self.agent_availability_feedback.write() {
             *guard = Some(feedback);
         }
+    }
+
+    pub fn with_external_reply_sender(&self, sender: Arc<dyn ExternalConversationReplySender>) {
+        if let Ok(mut guard) = self.external_reply_sender.write() {
+            *guard = Some(sender);
+        }
+    }
+
+    fn external_reply_target(&self, row: &ConversationRow) -> Option<ExternalReplyTarget> {
+        let source = row.source.as_deref()?.trim();
+        let chat_id = row.channel_chat_id.as_deref()?.trim();
+        if source.is_empty() || chat_id.is_empty() || source == "aionui" {
+            return None;
+        }
+        let sender = self.external_reply_sender.read().ok()?.as_ref()?.clone();
+        Some(ExternalReplyTarget::new(sender, source, chat_id))
     }
 
     /// Register a hook to be notified when a conversation is deleted.
@@ -2577,6 +2596,31 @@ impl ConversationService {
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<SendMessageResponse, ConversationError> {
+        self.send_message_inner(user_id, conversation_id, req, task_manager, false)
+            .await
+    }
+
+    /// Send a message from the AionUI conversation UI and mirror the final
+    /// assistant reply to the external channel owning this conversation.
+    pub async fn send_message_with_external_reply(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<SendMessageResponse, ConversationError> {
+        self.send_message_inner(user_id, conversation_id, req, task_manager, true)
+            .await
+    }
+
+    async fn send_message_inner(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        mirror_external_reply: bool,
+    ) -> Result<SendMessageResponse, ConversationError> {
         if req.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Message content must not be empty".into(),
@@ -2686,6 +2730,9 @@ impl ConversationService {
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
+        let external_reply = mirror_external_reply
+            .then(|| self.external_reply_target(&row))
+            .flatten();
 
         let user_msg_id_ret = user_msg_id.clone();
         ConversationTurnOrchestrator::new(self.clone(), Arc::clone(task_manager)).spawn_user_turn(TurnStartInput {
@@ -2697,6 +2744,7 @@ impl ConversationService {
             stored_workspace,
             turn_id: turn_id.clone(),
             turn_claim,
+            external_reply,
         });
 
         info!(
@@ -2821,6 +2869,7 @@ impl ConversationService {
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
+                external_reply: None,
             })
             .await;
 

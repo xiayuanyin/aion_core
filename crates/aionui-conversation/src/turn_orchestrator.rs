@@ -13,7 +13,7 @@ use crate::runtime_state::TurnClaim;
 use crate::service::{
     ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
 };
-use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
+use crate::stream_relay::{ExternalReplyTarget, RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
 use aionui_api_types::SendMessageRequest;
@@ -34,6 +34,7 @@ pub(crate) struct TurnStartInput {
     pub stored_workspace: String,
     pub turn_id: String,
     pub turn_claim: TurnClaim,
+    pub external_reply: Option<ExternalReplyTarget>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,7 @@ struct TurnAttemptInput {
     required_runtime_mode: Option<String>,
     continuation_count: usize,
     defer_clean_terminal_errors: bool,
+    external_reply: Option<ExternalReplyTarget>,
 }
 
 struct TurnAttemptResult {
@@ -214,6 +216,11 @@ impl ConversationTurnOrchestrator {
             .with_persistence(persistence.clone())
             .with_turn_completion(false)
             .with_defer_clean_terminal_errors(defer_clean_terminal_errors);
+            let relay = if let Some(target) = input.external_reply.clone() {
+                relay.with_external_reply(target)
+            } else {
+                relay
+            };
 
             let rx = agent.subscribe();
             if let Some(mode) = input
@@ -382,6 +389,7 @@ impl ConversationTurnOrchestrator {
                     required_runtime_mode: input.required_runtime_mode.clone(),
                     continuation_count: 0,
                     defer_clean_terminal_errors: !replayed,
+                    external_reply: input.external_reply.clone(),
                 })
                 .await
             {

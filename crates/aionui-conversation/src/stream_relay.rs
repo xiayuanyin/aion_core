@@ -21,6 +21,35 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, info, warn};
 
+/// Sends the final assistant reply to the external channel that owns a
+/// conversation. The conversation crate stays independent of concrete
+/// channel implementations through this small adapter.
+#[async_trait::async_trait]
+pub trait ExternalConversationReplySender: Send + Sync {
+    async fn send_text(&self, source: &str, chat_id: &str, text: &str) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub struct ExternalReplyTarget {
+    sender: Arc<dyn ExternalConversationReplySender>,
+    source: String,
+    chat_id: String,
+}
+
+impl ExternalReplyTarget {
+    pub fn new(
+        sender: Arc<dyn ExternalConversationReplySender>,
+        source: impl Into<String>,
+        chat_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            sender,
+            source: source.into(),
+            chat_id: chat_id.into(),
+        }
+    }
+}
+
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
 
@@ -106,6 +135,7 @@ pub struct StreamRelay {
     adapter: StreamPersistenceAdapter,
     complete_turn: bool,
     defer_clean_terminal_errors: bool,
+    external_reply: Option<ExternalReplyTarget>,
 }
 
 impl StreamRelay {
@@ -131,6 +161,7 @@ impl StreamRelay {
             adapter,
             complete_turn: true,
             defer_clean_terminal_errors: false,
+            external_reply: None,
         }
     }
 
@@ -162,6 +193,11 @@ impl StreamRelay {
 
     pub fn with_defer_clean_terminal_errors(mut self, enabled: bool) -> Self {
         self.defer_clean_terminal_errors = enabled;
+        self
+    }
+
+    pub fn with_external_reply(mut self, target: ExternalReplyTarget) -> Self {
+        self.external_reply = Some(target);
         self
     }
 
@@ -677,6 +713,23 @@ impl StreamRelay {
 
             self.send_system_responses(&processed.system_responses);
             outcome.system_responses = processed.system_responses;
+
+            if status == "finish"
+                && !final_text.is_empty()
+                && let Some(target) = &self.external_reply
+                && let Err(error) = target
+                    .sender
+                    .send_text(&target.source, &target.chat_id, &final_text)
+                    .await
+            {
+                warn!(
+                    conversation_id = %self.conversation_id,
+                    source = %target.source,
+                    chat_id = %target.chat_id,
+                    error,
+                    "Failed to push assistant reply to external channel"
+                );
+            }
         } else if let AgentStreamEvent::Error(data) = event {
             self.adapter.persist_error_tip(data).await;
         }
@@ -868,6 +921,23 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingExternalReplySender {
+        calls: Mutex<Vec<(String, String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalConversationReplySender for RecordingExternalReplySender {
+        async fn send_text(&self, source: &str, chat_id: &str, text: &str) -> Result<(), String> {
+            self.calls.lock().expect("external sender lock").push((
+                source.to_owned(),
+                chat_id.to_owned(),
+                text.to_owned(),
+            ));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn shared_skill_resolver_filters_requests_to_allowed_skill_names() {
         let concrete = Arc::new(RecordingSkillResolverForRelay::default());
@@ -927,6 +997,37 @@ mod tests {
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Hello World");
+    }
+
+    #[tokio::test]
+    async fn run_pushes_final_text_to_external_conversation_target() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let sender = Arc::new(RecordingExternalReplySender::default());
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo,
+            bus,
+        )
+        .with_external_reply(ExternalReplyTarget::new(sender.clone(), "wecom", "wx-group"));
+        let (tx, _) = broadcast::channel(16);
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "final answer".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        assert_eq!(
+            sender.calls.lock().unwrap().as_slice(),
+            [("wecom".into(), "wx-group".into(), "final answer".into())]
+        );
     }
 
     #[tokio::test]

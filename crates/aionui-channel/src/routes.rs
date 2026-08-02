@@ -9,10 +9,11 @@ use axum::routing::{get, post, put};
 use tracing::warn;
 
 use aionui_api_types::{
-    ApiResponse, ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelDefaultModelSetting,
-    ChannelPlatformSettingsResponse, ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest,
-    EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
-    SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
+    ApiResponse, ApprovePairingRequest, BridgeResponse, ChannelActiveMessageRequest, ChannelActiveMessageResponse,
+    ChannelAssistantSettingRequest, ChannelDefaultModelSetting, ChannelPlatformSettingsResponse,
+    ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest, EnablePluginRequest, PairingRequestResponse,
+    PluginStatusResponse, RejectPairingRequest, RevokeUserRequest, SyncChannelSettingsRequest, TestPluginRequest,
+    TestPluginResponse,
 };
 use aionui_common::ApiError;
 use aionui_db::{DbError, IChannelRepository};
@@ -24,7 +25,7 @@ use crate::error::ChannelError;
 use crate::manager::{ChannelManager, PluginFactory};
 use crate::pairing::PairingService;
 use crate::session::SessionManager;
-use crate::types::{PluginConfig, PluginConfigOptions, PluginCredentials, PluginType};
+use crate::types::{PluginConfig, PluginConfigOptions, PluginCredentials, PluginType, UnifiedOutgoingMessage};
 
 use std::collections::HashMap;
 
@@ -92,6 +93,10 @@ pub fn channel_routes(state: ChannelRouterState) -> Router {
         .route("/api/channel/plugins/enable", post(enable_plugin))
         .route("/api/channel/plugins/disable", post(disable_plugin))
         .route("/api/channel/plugins/test", post(test_plugin))
+        .route(
+            "/api/channel/plugins/{plugin_id}/active-message",
+            post(send_active_message),
+        )
         // Pairing management
         .route("/api/channel/pairings", get(get_pending_pairings))
         .route("/api/channel/pairings/approve", post(approve_pairing))
@@ -430,6 +435,24 @@ async fn test_plugin(
             error: Some(e.to_string()),
         }))),
     }
+}
+
+/// `POST /api/channel/plugins/:plugin_id/active-message` — push a message
+/// without waiting for an inbound channel callback.
+async fn send_active_message(
+    State(state): State<ChannelRouterState>,
+    Path(plugin_id): Path<String>,
+    body: Result<Json<ChannelActiveMessageRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ChannelActiveMessageResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let chat_id = req.chat_id.trim();
+    if chat_id.is_empty() {
+        return Err(ApiError::BadRequest("chat_id must not be empty".into()));
+    }
+    let message: UnifiedOutgoingMessage = serde_json::from_value(req.message)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid message: {error}")))?;
+    let request_id = state.manager.send_active_message(&plugin_id, chat_id, message).await?;
+    Ok(Json(ApiResponse::ok(ChannelActiveMessageResponse { request_id })))
 }
 
 // ---------------------------------------------------------------------------

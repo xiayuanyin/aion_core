@@ -56,6 +56,58 @@ async fn get_plugins_unauthenticated() {
     assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
+#[tokio::test]
+async fn active_message_requires_authentication() {
+    let (app, _services) = build_app().await;
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/channel/plugins/wecom/active-message")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            r#"{"chat_id":"user-1","message":{"type":"text","text":"hello"}}"#,
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn active_message_rejects_empty_chat_id() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let req = json_with_token(
+        "POST",
+        "/api/channel/plugins/wecom/active-message",
+        json!({
+            "chat_id": " ",
+            "message": {"type":"text", "text":"hello"}
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "BAD_REQUEST");
+}
+
+#[tokio::test]
+async fn active_message_rejects_invalid_message_shape() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let req = json_with_token(
+        "POST",
+        "/api/channel/plugins/wecom/active-message",
+        json!({"chat_id":"user-1", "message":{"text":"missing type"}}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "BAD_REQUEST");
+}
+
 // EP-3: Enable missing pluginId fails
 #[tokio::test]
 async fn enable_plugin_missing_plugin_id() {

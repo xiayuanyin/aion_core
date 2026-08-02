@@ -12,7 +12,7 @@ use aionui_assistant::{
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
-use aionui_conversation::{ConversationRouterState, ConversationService};
+use aionui_conversation::{ConversationRouterState, ConversationService, ExternalConversationReplySender};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -51,6 +51,34 @@ use aionui_team::{
 use crate::config::derive_encryption_key;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
+
+struct ChannelExternalReplySender {
+    manager: Arc<aionui_channel::manager::ChannelManager>,
+}
+
+#[async_trait::async_trait]
+impl ExternalConversationReplySender for ChannelExternalReplySender {
+    async fn send_text(&self, source: &str, chat_id: &str, text: &str) -> Result<(), String> {
+        let message = aionui_channel::types::UnifiedOutgoingMessage {
+            message_type: aionui_channel::types::OutgoingMessageType::Text,
+            text: Some(text.to_owned()),
+            parse_mode: None,
+            buttons: None,
+            keyboard: None,
+            image_url: None,
+            file_url: None,
+            file_name: None,
+            media_actions: None,
+            reply_to_message_id: None,
+            silent: None,
+        };
+        self.manager
+            .send_active_message(source, chat_id, message)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
 
 #[derive(Debug)]
 pub struct RouterBuildError {
@@ -219,6 +247,11 @@ pub async fn build_module_states(
 
     let (channel_state, channel_components) = build_channel_state(services, ext_state.registry.clone()).await;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
+    services
+        .conversation_service
+        .with_external_reply_sender(Arc::new(ChannelExternalReplySender {
+            manager: channel_components.manager.clone(),
+        }));
 
     let backend_binary_path = Arc::new(
         std::env::current_exe()

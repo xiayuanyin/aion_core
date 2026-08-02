@@ -36,6 +36,7 @@ pub use service::{
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
 };
 pub use state::ConversationRouterState;
+pub use stream_relay::{ExternalConversationReplySender, ExternalReplyTarget};
 
 #[cfg(test)]
 #[path = "service_test.rs"]

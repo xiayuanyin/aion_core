@@ -429,6 +429,21 @@ impl ChannelManager {
         plugin.send_message(chat_id, message).await
     }
 
+    /// Sends a message without an inbound callback, when the platform
+    /// supports an active-push API (currently WeCom).
+    pub async fn send_active_message(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        message: crate::types::UnifiedOutgoingMessage,
+    ) -> Result<String, ChannelError> {
+        let plugin = self
+            .plugins
+            .get(plugin_id)
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+        plugin.send_active_message(chat_id, message).await
+    }
+
     /// Edits an existing message through a specific plugin.
     pub async fn edit_message(
         &self,
