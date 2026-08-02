@@ -67,6 +67,7 @@ impl ChannelOrchestrator {
         let chat_id = msg.chat_id.clone();
         let plugin_id = platform.to_string();
         let text = msg.content.text.clone();
+        let attachments = msg.content.attachments.clone().unwrap_or_default();
 
         let executor = Arc::clone(&self.action_executor);
         let msg_svc = Arc::clone(&self.message_service);
@@ -89,6 +90,7 @@ impl ChannelOrchestrator {
                         &session_id,
                         conversation_id.as_deref(),
                         &text,
+                        &attachments,
                         platform,
                         &plugin_id,
                         &chat_id,
@@ -148,6 +150,7 @@ async fn handle_dispatched(
     session_id: &str,
     conversation_id: Option<&str>,
     text: &str,
+    attachments: &[crate::types::UnifiedAttachment],
     platform: crate::types::PluginType,
     plugin_id: &str,
     chat_id: &str,
@@ -164,7 +167,10 @@ async fn handle_dispatched(
         }
     };
 
-    let send_result = match msg_svc.send_to_agent(&session, text, platform).await {
+    let send_result = match msg_svc
+        .send_to_agent_with_attachments(&session, text, attachments, platform)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "failed to send to agent");

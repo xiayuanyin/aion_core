@@ -4601,6 +4601,7 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
                 content: "hello".into(),
                 hidden: false,
                 files: vec![],
+                attachments: vec![],
                 inject_skills: vec![],
             },
             &task_mgr,

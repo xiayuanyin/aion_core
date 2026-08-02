@@ -96,9 +96,23 @@ pub struct SendMessageRequest {
     #[serde(default)]
     pub files: Vec<String>,
     #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
+    #[serde(default)]
     pub inject_skills: Vec<String>,
     #[serde(default)]
     pub hidden: bool,
+}
+
+/// Metadata for a local attachment persisted with a user message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageAttachment {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
 }
 
 /// Response for `POST /api/conversations/:id/messages`.

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, SendMessageRequest};
+use aionui_api_types::{
+    AssistantConversationRequest, CreateConversationRequest, MessageAttachment, SendMessageRequest,
+};
 use aionui_common::{AgentType, ConversationSource};
 use aionui_conversation::ConversationService;
 use aionui_db::models::AssistantSessionRow;
@@ -60,6 +62,16 @@ impl ChannelMessageService {
         text: &str,
         platform: PluginType,
     ) -> Result<SendResult, ChannelError> {
+        self.send_to_agent_with_attachments(session, text, &[], platform).await
+    }
+
+    pub async fn send_to_agent_with_attachments(
+        &self,
+        session: &AssistantSessionRow,
+        text: &str,
+        attachments: &[crate::types::UnifiedAttachment],
+        platform: PluginType,
+    ) -> Result<SendResult, ChannelError> {
         // Ensure conversation exists
         let conversation_id = match &session.conversation_id {
             Some(cid) => cid.clone(),
@@ -70,9 +82,34 @@ impl ChannelMessageService {
         // server-generated inside the service; channel plugins that need to
         // correlate the user message back to the conversation should use
         // `conversation_id` + stream events instead of a client-provided id.
+        let files: Vec<String> = attachments
+            .iter()
+            .filter_map(|attachment| attachment.url.clone())
+            .collect();
+        let content = if files.is_empty() {
+            text.to_owned()
+        } else {
+            format!(
+                "{}\n\n{}\n{}",
+                text,
+                aionui_common::constants::AIONUI_FILES_MARKER,
+                files.join("\n")
+            )
+        };
         let req = SendMessageRequest {
-            content: text.to_owned(),
-            files: vec![],
+            content,
+            files: files.clone(),
+            attachments: attachments
+                .iter()
+                .filter_map(|attachment| {
+                    attachment.url.as_ref().map(|path| MessageAttachment {
+                        path: path.clone(),
+                        file_name: attachment.file_name.clone(),
+                        mime_type: attachment.mime_type.clone(),
+                        file_size: attachment.file_size,
+                    })
+                })
+                .collect(),
             inject_skills: vec![],
             hidden: false,
         };

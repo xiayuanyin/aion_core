@@ -1,9 +1,14 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aes::Aes256;
+use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -482,7 +487,8 @@ async fn connect_once(
                         }
                         let cmd = frame.get("cmd").and_then(serde_json::Value::as_str).unwrap_or("");
                         if (cmd == "aibot_msg_callback" || cmd == "aibot_event_callback") && authenticated {
-                            if let Some(message) = parse_incoming(&frame, &mut seen) {
+                            if let Some(mut message) = parse_incoming(&frame, &mut seen) {
+                                prepare_media_attachments(&frame, &mut message).await;
                                 remember_request(&message.chat_id, req_id);
                                 let _ = context.callbacks.message_tx.send(message).await;
                             } else if cmd == "aibot_event_callback" && mark_event_seen(&frame, &mut seen) {
@@ -693,11 +699,264 @@ fn media_attachment(body: &serde_json::Value, kind: &str, mime_type: &str) -> Op
             .get("media_id")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned),
-        file_name: None,
+        file_name: media
+            .get("filename")
+            .or_else(|| media.get("file_name"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
         mime_type: Some(mime_type.into()),
         file_size: media.get("filesize").and_then(serde_json::Value::as_u64),
         url: Some(url),
     }])
+}
+
+const MAX_MEDIA_BYTES: usize = 50 * 1024 * 1024;
+
+/// Download and decrypt WeCom media before handing the message to the channel
+/// orchestrator. The remote URL is short-lived, so it must never be deferred
+/// to the UI.
+async fn prepare_media_attachments(frame: &serde_json::Value, message: &mut UnifiedIncomingMessage) {
+    let Some(attachments) = message.content.attachments.as_mut() else {
+        return;
+    };
+    let message_id = message.id.clone();
+    let Some(body) = frame.get("body") else { return };
+    let mut media_items = Vec::new();
+    match body.get("msgtype").and_then(serde_json::Value::as_str) {
+        Some("image") => body.get("image").into_iter().for_each(|value| media_items.push(value)),
+        Some("file") => body.get("file").into_iter().for_each(|value| media_items.push(value)),
+        Some("video") => body.get("video").into_iter().for_each(|value| media_items.push(value)),
+        Some("mixed") => {
+            if let Some(items) = body.pointer("/mixed/msg_item").and_then(serde_json::Value::as_array) {
+                for item in items {
+                    if matches!(
+                        item.get("msgtype").and_then(serde_json::Value::as_str),
+                        Some("image" | "file" | "video")
+                    ) {
+                        let key = item.get("msgtype").and_then(serde_json::Value::as_str).unwrap();
+                        if let Some(value) = item.get(key) {
+                            media_items.push(value);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut prepared = Vec::with_capacity(attachments.len());
+    for attachment in attachments.drain(..) {
+        let media = media_items
+            .iter()
+            .find(|item| item.get("url").and_then(serde_json::Value::as_str) == attachment.url.as_deref());
+        let Some(media) = media else { continue };
+        let Some(url) = attachment.url.as_deref() else { continue };
+        let Some(aeskey) = media.get("aeskey").and_then(serde_json::Value::as_str) else {
+            warn!("WeCom media did not include aeskey");
+            continue;
+        };
+        match download_and_decrypt_media(url, aeskey, attachment.file_name.as_deref(), &message_id).await {
+            Ok((path, size, detected_mime)) => {
+                let mut attachment = attachment;
+                attachment.url = Some(path);
+                attachment.file_size = Some(size);
+                if attachment.mime_type.as_deref().is_some_and(|mime| mime.ends_with("/*")) {
+                    attachment.mime_type = detected_mime.or(attachment.mime_type);
+                }
+                prepared.push(attachment);
+            }
+            Err(error) => warn!(error = %error, "failed to download WeCom media"),
+        }
+    }
+    *attachments = prepared;
+}
+
+async fn download_and_decrypt_media(
+    url: &str,
+    aeskey: &str,
+    file_name: Option<&str>,
+    message_id: &str,
+) -> Result<(String, u64, Option<String>), String> {
+    let response = reqwest::get(url)
+        .await
+        .map_err(|error| format!("download failed: {error}"))?;
+    if let Some(length) = response.content_length()
+        && length > MAX_MEDIA_BYTES as u64
+    {
+        return Err("media exceeds 50 MiB limit".into());
+    }
+    let encrypted = response
+        .bytes()
+        .await
+        .map_err(|error| format!("read download failed: {error}"))?;
+    if encrypted.len() > MAX_MEDIA_BYTES {
+        return Err("media exceeds 50 MiB limit".into());
+    }
+    let decrypted = decrypt_media(&encrypted, aeskey)?;
+    let mime = detect_media_mime(&decrypted);
+    let name = safe_media_name(file_name, mime.as_deref(), message_id);
+    let dir = std::env::temp_dir()
+        .join("aionui")
+        .join("wecom")
+        .join(safe_component(message_id));
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|error| format!("create attachment directory failed: {error}"))?;
+    let (stem, extension) = Path::new(&name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|stem| {
+            (
+                stem.to_owned(),
+                Path::new(&name)
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned),
+            )
+        })
+        .unwrap_or_else(|| (name.clone(), None));
+    for suffix in 0..1000u16 {
+        let candidate = match (&extension, suffix) {
+            (Some(extension), 0) => format!("{stem}.{extension}"),
+            (Some(extension), suffix) => format!("{stem}-{suffix}.{extension}"),
+            (None, 0) => stem.clone(),
+            (None, suffix) => format!("{stem}-{suffix}"),
+        };
+        let path = dir.join(candidate);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(mut file) => {
+                file.write_all(&decrypted)
+                    .await
+                    .map_err(|error| format!("save attachment failed: {error}"))?;
+                return Ok((path.to_string_lossy().into_owned(), decrypted.len() as u64, mime));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("save attachment failed: {error}")),
+        }
+    }
+    Err("could not allocate a unique attachment path".into())
+}
+
+fn decrypt_media(encrypted: &[u8], aeskey: &str) -> Result<Vec<u8>, String> {
+    let key = decode_aes_key(aeskey)?;
+    if encrypted.is_empty() || !encrypted.len().is_multiple_of(16) {
+        return Err("encrypted media has invalid block length".into());
+    }
+    let cipher = Aes256::new_from_slice(&key).map_err(|_| "invalid AES key".to_owned())?;
+    let mut previous = [0u8; 16];
+    previous.copy_from_slice(&key[..16]);
+    let mut plaintext = Vec::with_capacity(encrypted.len());
+    for chunk in encrypted.chunks_exact(16) {
+        let mut block = GenericArray::clone_from_slice(chunk);
+        cipher.decrypt_block(&mut block);
+        for (index, value) in block.iter_mut().enumerate() {
+            *value ^= previous[index];
+        }
+        plaintext.extend_from_slice(&block);
+        previous.copy_from_slice(chunk);
+    }
+    let padding = *plaintext.last().ok_or_else(|| "decrypted media is empty".to_owned())? as usize;
+    if !(1..=32).contains(&padding)
+        || padding > plaintext.len()
+        || !plaintext[plaintext.len() - padding..]
+            .iter()
+            .all(|value| *value as usize == padding)
+    {
+        return Err("invalid PKCS#7 padding".into());
+    }
+    plaintext.truncate(plaintext.len() - padding);
+    Ok(plaintext)
+}
+
+fn decode_aes_key(value: &str) -> Result<Vec<u8>, String> {
+    let value = value.trim();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(value))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(value))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value))
+        .ok()
+        .filter(|bytes| bytes.len() == 32)
+        .or_else(|| hex::decode(value).ok().filter(|bytes| bytes.len() == 32))
+        .ok_or_else(|| "aeskey is not a 32-byte base64/hex key".to_owned())?;
+    Ok(decoded)
+}
+
+fn safe_media_name(file_name: Option<&str>, mime: Option<&str>, message_id: &str) -> String {
+    let original = file_name.unwrap_or_default();
+    let base = Path::new(original)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty());
+    if let Some(base) = base {
+        let sanitized: String = base
+            .chars()
+            .map(|value| {
+                if value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_') {
+                    value
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if Path::new(&sanitized).extension().is_none()
+            && let Some(extension) = mime.and_then(media_extension)
+        {
+            return format!("{sanitized}.{extension}");
+        }
+        return sanitized;
+    }
+    let extension = mime.and_then(media_extension).unwrap_or("bin");
+    format!("wecom-{}.{extension}", safe_component(message_id))
+}
+
+fn media_extension(mime: &str) -> Option<&str> {
+    Some(match mime {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        _ => mime.split('/').nth(1).filter(|value| !value.is_empty())?,
+    })
+}
+
+fn safe_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "message".into()
+    } else {
+        sanitized
+    }
+}
+
+fn detect_media_mime(bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png".into())
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg".into())
+    } else if bytes.starts_with(b"GIF8") {
+        Some("image/gif".into())
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp".into())
+    } else {
+        None
+    }
 }
 
 fn parse_mixed(body: &serde_json::Value) -> Option<(String, Option<Vec<UnifiedAttachment>>, MessageContentType)> {
@@ -1249,6 +1508,39 @@ mod tests {
         assert_eq!(message.chat_id, "group-1");
         assert_eq!(message.content.text, "hello\n[图片]");
         assert_eq!(message.content.attachments.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn decrypts_wecom_aes256_cbc_with_key_prefix_iv_and_32_byte_padding() {
+        use aes::cipher::BlockEncrypt;
+
+        let key: Vec<u8> = (0..32).collect();
+        let mut padded = b"wecom attachment".to_vec();
+        padded.extend(std::iter::repeat_n(
+            (32 - padded.len() % 32) as u8,
+            32 - padded.len() % 32,
+        ));
+        let cipher = Aes256::new_from_slice(&key).unwrap();
+        let mut previous = [0u8; 16];
+        previous.copy_from_slice(&key[..16]);
+        let mut encrypted = Vec::new();
+        for chunk in padded.chunks_exact(16) {
+            let mut block = GenericArray::clone_from_slice(chunk);
+            for (index, value) in block.iter_mut().enumerate() {
+                *value ^= previous[index];
+            }
+            cipher.encrypt_block(&mut block);
+            previous.copy_from_slice(&block);
+            encrypted.extend_from_slice(&block);
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&key);
+        assert_eq!(decrypt_media(&encrypted, &encoded).unwrap(), b"wecom attachment");
+
+        let unpadded_standard = base64::engine::general_purpose::STANDARD
+            .encode([0xfb_u8; 32])
+            .trim_end_matches('=')
+            .to_owned();
+        assert_eq!(decode_aes_key(&unpadded_standard).unwrap(), vec![0xfb_u8; 32]);
     }
 
     #[test]
