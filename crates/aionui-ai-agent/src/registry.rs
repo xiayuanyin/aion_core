@@ -531,6 +531,9 @@ fn decode_row(
     let env_override_raw = row.env_override.clone();
 
     let agent_type = parse_agent_type(&row.agent_type)?;
+    if !aionui_common::host_allows_agent_type(agent_type) {
+        return None;
+    }
     let agent_source = parse_agent_source(&row.agent_source)?;
     let agent_source_info = decode_json_field(row.agent_source_info.as_deref(), "agent_source_info")
         .unwrap_or_else(AgentSourceInfo::default);

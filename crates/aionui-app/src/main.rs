@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use aionui_app::AppServices;
+use aionui_common::{ExternalAcpPolicy, set_external_acp_policy};
 use cli::{Cli, Command};
 
 use crate::bootstrap::parent_exit_signal;
@@ -28,6 +29,11 @@ fn main() -> ExitCode {
 
 fn run_main() -> Result<ExitCode, MainError> {
     let cli = Cli::parse();
+    set_external_acp_policy(if cli.disable_external_acp {
+        ExternalAcpPolicy::Disabled
+    } else {
+        ExternalAcpPolicy::Enabled
+    });
 
     // mcp-* subcommands route into short-lived stdio helpers that live entirely
     // outside the main HTTP server. They share the global flags so clap can

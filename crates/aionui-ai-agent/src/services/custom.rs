@@ -17,7 +17,7 @@ use crate::error::AgentError;
 use aionui_api_types::{
     AgentMetadata, CustomAgentUpsertRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
-use aionui_common::generate_short_id;
+use aionui_common::{AgentType, generate_short_id};
 use aionui_db::UpsertAgentMetadataParams;
 use tracing::warn;
 
@@ -35,6 +35,7 @@ impl AgentService {
         &self,
         req: TryConnectCustomAgentRequest,
     ) -> Result<TryConnectCustomAgentResponse, AgentError> {
+        reject_external_acp_disabled()?;
         if req.command.trim().is_empty() {
             return Err(AgentError::bad_request("command must not be empty"));
         }
@@ -46,6 +47,7 @@ impl AgentService {
     }
 
     pub async fn create_custom_agent(&self, req: CustomAgentUpsertRequest) -> Result<AgentMetadata, AgentError> {
+        reject_external_acp_disabled()?;
         validate_upsert(&req)?;
         probe_or_reject(&req).await?;
 
@@ -58,6 +60,7 @@ impl AgentService {
         id: &str,
         req: CustomAgentUpsertRequest,
     ) -> Result<AgentMetadata, AgentError> {
+        reject_external_acp_disabled()?;
         validate_upsert(&req)?;
         let existing = self
             .registry()
@@ -106,6 +109,17 @@ impl AgentService {
     }
 
     pub async fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<AgentMetadata, AgentError> {
+        let existing = self
+            .registry()
+            .repo_handle()
+            .get(id)
+            .await
+            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
+        if existing.agent_type == AgentType::Acp.serde_name() {
+            reject_external_acp_disabled()?;
+        }
+
         let updated = self
             .registry()
             .repo_handle()
@@ -195,6 +209,14 @@ impl AgentService {
             .get(id)
             .await
             .ok_or_else(|| AgentError::internal(format!("Agent '{id}' not visible after upsert")))
+    }
+}
+
+fn reject_external_acp_disabled() -> Result<(), AgentError> {
+    if aionui_common::host_allows_agent_type(aionui_common::AgentType::Acp) {
+        Ok(())
+    } else {
+        Err(AgentError::bad_request(aionui_common::EXTERNAL_ACP_DISABLED_MESSAGE))
     }
 }
 

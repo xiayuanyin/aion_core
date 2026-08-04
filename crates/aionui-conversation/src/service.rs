@@ -287,15 +287,21 @@ fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), Conversati
         return Ok(());
     };
 
-    if agent_type.is_deprecated_runtime() {
+    let blocked_by_host = !aionui_common::host_allows_agent_type(agent_type);
+    if agent_type.is_deprecated_runtime() || blocked_by_host {
         debug!(
             conversation_id = %row.id,
             agent_type = agent_type.serde_name(),
-            "Rejected deprecated runtime conversation"
+            blocked_by_host,
+            "Rejected unavailable runtime conversation"
         );
         return Err(ConversationError::Archived {
             id: row.id.clone(),
-            reason: LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into(),
+            reason: if blocked_by_host {
+                aionui_common::EXTERNAL_ACP_DISABLED_MESSAGE.into()
+            } else {
+                LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into()
+            },
         });
     }
 
@@ -743,6 +749,17 @@ impl ConversationService {
         };
         let explicit_type = req.r#type;
         let effective_type = resolve_create_agent_type(explicit_type, assistant_snapshot.as_ref())?;
+
+        if !aionui_common::host_allows_agent_type(effective_type) {
+            info!(
+                agent_type = effective_type.serde_name(),
+                source = ?source,
+                "Rejected agent type disabled by host policy"
+            );
+            return Err(ConversationError::BadRequest {
+                reason: aionui_common::EXTERNAL_ACP_DISABLED_MESSAGE.into(),
+            });
+        }
 
         if !effective_type.supports_new_conversation() {
             info!(

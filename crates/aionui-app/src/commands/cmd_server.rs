@@ -232,6 +232,10 @@ pub(crate) async fn run_server(
     info!(elapsed_ms = boot.elapsed().as_millis(), "Server listening on {addr}");
 
     let runtime_prepare_service = RuntimePrepareService::new(services.event_bus.clone());
+    let external_acp_enabled = aionui_common::host_allows_agent_type(aionui_common::AgentType::Acp);
+    if !external_acp_enabled {
+        info!("startup: external ACP runtimes disabled by host policy");
+    }
     tokio::spawn(async move {
         let scope = RuntimeStatusScope {
             kind: RuntimeStatusScopeKind::CustomAgent,
@@ -241,12 +245,14 @@ pub(crate) async fn run_server(
         info!("startup: managed runtime background preparation started");
         let result = async {
             runtime_prepare_service.ensure_node_runtime(scope.clone()).await?;
-            runtime_prepare_service
-                .ensure_managed_acp_tool(scope.clone(), "codex-acp")
-                .await?;
-            runtime_prepare_service
-                .ensure_managed_acp_tool(scope, "claude-agent-acp")
-                .await?;
+            if external_acp_enabled {
+                runtime_prepare_service
+                    .ensure_managed_acp_tool(scope.clone(), "codex-acp")
+                    .await?;
+                runtime_prepare_service
+                    .ensure_managed_acp_tool(scope, "claude-agent-acp")
+                    .await?;
+            }
             Ok::<(), aionui_system::SystemError>(())
         }
         .await;

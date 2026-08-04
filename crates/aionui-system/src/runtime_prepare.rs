@@ -39,6 +39,11 @@ impl RuntimePrepareService {
         scope: RuntimeStatusScope,
         tool_id: &str,
     ) -> Result<EnsureManagedAcpToolResponse, SystemError> {
+        if !aionui_common::host_allows_agent_type(aionui_common::AgentType::Acp) {
+            return Err(SystemError::BadRequest(
+                aionui_common::EXTERNAL_ACP_DISABLED_MESSAGE.into(),
+            ));
+        }
         let tool = ManagedAcpToolId::from_slug(tool_id)
             .ok_or_else(|| SystemError::BadRequest(format!("Unsupported managed ACP tool '{tool_id}'")))?;
         let node_reporter = self.node_runtime_reporter(scope.clone());

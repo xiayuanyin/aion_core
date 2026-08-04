@@ -401,19 +401,25 @@ fn parse_extra(row: &ConversationRow) -> Result<serde_json::Value, ConversationE
 }
 
 fn reject_deprecated_runtime_kind(row: &ConversationRow, agent_type: &AgentType) -> Result<(), ConversationError> {
-    if !agent_type.is_deprecated_runtime() {
+    let blocked_by_host = !aionui_common::host_allows_agent_type(*agent_type);
+    if !agent_type.is_deprecated_runtime() && !blocked_by_host {
         return Ok(());
     }
 
     debug!(
         conversation_id = %row.id,
         agent_type = agent_type.serde_name(),
-        "Rejected deprecated runtime conversation before session context build"
+        blocked_by_host,
+        "Rejected unavailable runtime conversation before session context build"
     );
 
     Err(ConversationError::Archived {
         id: row.id.clone(),
-        reason: LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into(),
+        reason: if blocked_by_host {
+            aionui_common::EXTERNAL_ACP_DISABLED_MESSAGE.into()
+        } else {
+            LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into()
+        },
     })
 }
 

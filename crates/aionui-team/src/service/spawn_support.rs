@@ -14,6 +14,11 @@ const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer suppor
 pub(crate) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     let quoted = format!("\"{backend}\"");
     if let Ok(agent_type) = serde_json::from_str::<AgentType>(&quoted) {
+        if !aionui_common::host_allows_agent_type(agent_type) {
+            return Err(TeamError::InvalidRequest(
+                aionui_common::EXTERNAL_ACP_DISABLED_MESSAGE.into(),
+            ));
+        }
         if agent_type.is_deprecated_runtime() {
             return Err(TeamError::InvalidRequest(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
         }

@@ -10,6 +10,7 @@ mod injected_env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aionui_common::EXTERNAL_ACP_DISABLED_MESSAGE;
 use aionui_db::{IClientPreferenceRepository, IMcpServerRepository, IProviderRepository};
 use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
@@ -68,6 +69,9 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
     match context.kind {
+        AgentSessionKind::Acp(_) if !aionui_common::host_allows_agent_type(aionui_common::AgentType::Acp) => {
+            Err(AgentError::bad_request(EXTERNAL_ACP_DISABLED_MESSAGE))
+        }
         AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
         AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
     }

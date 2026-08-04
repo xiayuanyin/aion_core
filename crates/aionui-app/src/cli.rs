@@ -61,6 +61,10 @@ pub(crate) struct Cli {
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,
 
+    /// Disable every external ACP agent and managed ACP runtime.
+    #[arg(long)]
+    pub disable_external_acp: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -664,6 +668,15 @@ mod tests {
     fn managed_resources_mode_accepts_download() {
         let cli = Cli::parse_from(["aioncore", "--managed-resources-mode", "download"]);
         assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
+    }
+
+    #[test]
+    fn disable_external_acp_is_explicit_opt_in() {
+        let default_cli = Cli::parse_from(["aioncore"]);
+        assert!(!default_cli.disable_external_acp);
+
+        let disabled_cli = Cli::parse_from(["aioncore", "--disable-external-acp"]);
+        assert!(disabled_cli.disable_external_acp);
     }
 
     #[test]

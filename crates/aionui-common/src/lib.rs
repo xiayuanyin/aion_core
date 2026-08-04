@@ -10,6 +10,7 @@ mod error;
 mod hooks;
 mod id;
 mod pagination;
+mod runtime_policy;
 mod timestamp;
 mod types;
 
@@ -27,5 +28,9 @@ pub use error::{
 pub use hooks::OnConversationDelete;
 pub use id::{fnv1a_hex8, generate_id, generate_id_with_length, generate_prefixed_id, generate_short_id};
 pub use pagination::PaginatedResult;
+pub use runtime_policy::{
+    EXTERNAL_ACP_DISABLED_MESSAGE, ExternalAcpPolicy, external_acp_policy, host_allows_agent_type,
+    set_external_acp_policy,
+};
 pub use timestamp::{TimestampMs, now_ms};
 pub use types::{CommandSpec, Confirmation, ConfirmationOption, EnvVar, ProviderWithModel, UpdateType, VersionInfo};
