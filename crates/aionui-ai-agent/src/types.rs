@@ -393,10 +393,11 @@ mod tests {
         });
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert_eq!(extra.system_prompt.as_deref(), Some("You are a helpful assistant."));
+        assert_eq!(extra.max_tokens, Some(4096));
         assert_eq!(extra.max_turns.unwrap(), 10);
         assert_eq!(extra.max_tool_call_malformed_turns.unwrap(), 2);
         assert_eq!(extra.max_tool_call_failure_turns.unwrap(), 3);
-        assert!(serde_json::to_value(extra).unwrap().get("max_tokens").is_none());
+        assert_eq!(serde_json::to_value(extra).unwrap()["max_tokens"], 4096);
     }
 
     #[test]
