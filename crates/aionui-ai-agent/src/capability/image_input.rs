@@ -21,6 +21,8 @@ struct ImageInputCatalog {
 struct ImageInputProvider {
     #[serde(default)]
     models: HashSet<String>,
+    #[serde(default)]
+    model_patterns: Vec<String>,
 }
 
 pub(crate) fn resolve_image_input_capability(model: &str) -> ImageInputCapability {
@@ -69,7 +71,37 @@ fn resolve_from_catalog(catalog: &ImageInputCatalog, model: &str) -> ImageInputC
 }
 
 fn model_supports_image(provider: &ImageInputProvider, model: &str) -> bool {
-    provider.models.contains(normalize_model_id(model))
+    let model = normalize_model_id(model);
+    provider.models.contains(model)
+        || provider
+            .model_patterns
+            .iter()
+            .any(|pattern| wildcard_matches(pattern, model))
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let (pattern, value) = (pattern.as_bytes(), value.as_bytes());
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let (mut star_index, mut star_value_index) = (None, 0);
+
+    while value_index < value.len() {
+        if pattern.get(pattern_index) == value.get(value_index) {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern.get(pattern_index) == Some(&b'*') {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_value_index = value_index;
+        } else if let Some(star_index) = star_index {
+            pattern_index = star_index + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+
+    pattern[pattern_index..].iter().all(|byte| *byte == b'*')
 }
 
 fn normalize_model_id(model: &str) -> &str {

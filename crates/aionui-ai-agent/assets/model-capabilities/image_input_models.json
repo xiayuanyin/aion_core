@@ -101,7 +101,10 @@
     },
     "deepseek": {
       "api": "https://api.deepseek.com/v1",
-      "models": []
+      "models": [],
+      "model_patterns": [
+        "deepseek-v4-*-vision*"
+      ]
     },
     "minimax": {
       "api": "https://api.minimaxi.com/v1",
@@ -454,6 +457,7 @@
     "zhipu": {
       "api": "https://open.bigmodel.cn/api/paas/v4",
       "models": [
+        "glm-5.3-flash",
         "glm-5v-turbo",
         "glm-4.6v",
         "glm-4.6v-flash",

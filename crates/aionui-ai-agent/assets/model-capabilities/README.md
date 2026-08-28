@@ -4,14 +4,14 @@
 
 The catalog is intentionally a positive allowlist:
 
-- Match both the provider API root and the exact model ID.
+- Match an exact model ID or an explicitly reviewed `model_patterns` entry. Patterns support `*` only.
 - Add a model only when the provider's own documentation confirms image input on the API protocol used by AionCore.
 - Treat an absent provider or model as `Unknown`, not as proof that image input is unsupported.
 - Do not copy a first-party model entry to an aggregator or a custom gateway. Those endpoints may expose different model IDs or capabilities.
 - Keep an empty `models` array when the preset endpoint is known but no stable model ID can be positively verified for that endpoint. This still records the AionUi preset without claiming image support.
 - Aggregator entries may be refreshed manually from that aggregator's own catalog. The reviewed result must be committed as a static snapshot; AionCore never fetches it at runtime.
 
-Poe bot names and Ctyun deployment model IDs are account- or deployment-specific, so they intentionally have no static model entries. DeepSeek does not currently expose a positively verified image-input chat model on the corresponding AionUi preset endpoint.
+Poe bot names and Ctyun deployment model IDs are account- or deployment-specific, so they intentionally have no static model entries. DeepSeek V4 vision variants use the `deepseek-v4-*-vision*` pattern on the corresponding AionUi preset endpoint.
 
 The list was last reviewed on 2026-07-15 against these provider-owned references:
 

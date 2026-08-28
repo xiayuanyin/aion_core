@@ -23,6 +23,9 @@ fn catalog() -> ImageInputCatalog {
             },
             "moonshot-global": {
                 "models": ["kimi-k2.6"]
+            },
+            "deepseek": {
+                "model_patterns": ["deepseek-v4-*-vision*"]
             }
         }
     }))
@@ -39,6 +42,10 @@ fn embedded_allowlist_is_valid_and_contains_regression_models() {
     );
     assert_eq!(
         resolve_from_catalog(&catalog, "kimi-k2.6"),
+        ImageInputCapability::Supported
+    );
+    assert_eq!(
+        resolve_from_catalog(&catalog, "deepseek-v4-flash-vision-exp"),
         ImageInputCapability::Supported
     );
 }
@@ -75,6 +82,32 @@ fn resolves_known_models_from_any_catalog_provider() {
         resolve_from_catalog(&catalog, "kimi-k2.6"),
         ImageInputCapability::Supported
     );
+}
+
+#[test]
+fn resolves_deepseek_v4_vision_model_patterns() {
+    let catalog = catalog();
+
+    for model in [
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-v4-pro-vision",
+        "deepseek-v4-lite-vision-preview",
+    ] {
+        assert_eq!(resolve_from_catalog(&catalog, model), ImageInputCapability::Supported);
+    }
+}
+
+#[test]
+fn deepseek_vision_pattern_fails_closed_for_other_models() {
+    let catalog = catalog();
+
+    for model in [
+        "deepseek-v4-flash",
+        "deepseek-v3-flash-vision-exp",
+        "other-v4-flash-vision-exp",
+    ] {
+        assert_eq!(resolve_from_catalog(&catalog, model), ImageInputCapability::Unknown);
+    }
 }
 
 #[test]
