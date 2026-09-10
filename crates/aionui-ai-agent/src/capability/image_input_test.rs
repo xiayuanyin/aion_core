@@ -48,6 +48,9 @@ fn embedded_allowlist_is_valid_and_contains_regression_models() {
         resolve_from_catalog(&catalog, "deepseek-v4-flash-vision-exp"),
         ImageInputCapability::Supported
     );
+    for model in ["deepseek-flash", "deepseek-pro"] {
+        assert_eq!(resolve_from_catalog(&catalog, model), ImageInputCapability::Supported);
+    }
 }
 
 #[test]

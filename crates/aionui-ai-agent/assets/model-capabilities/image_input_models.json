@@ -101,7 +101,10 @@
     },
     "deepseek": {
       "api": "https://api.deepseek.com/v1",
-      "models": [],
+      "models": [
+        "deepseek-flash",
+        "deepseek-pro"
+      ],
       "model_patterns": [
         "deepseek-v4-*-vision*"
       ]
