@@ -1,8 +1,10 @@
 use aion_types::message::ImageInputCapability;
 use serde_json::json;
+use std::fs;
 
 use super::{
-    IMAGE_INPUT_CATALOG_JSON, ImageInputCatalog, parse_catalog, resolve_from_catalog, resolve_image_input_capability,
+    IMAGE_INPUT_CATALOG_JSON, ImageInputCatalog, additional_models_support_image, initialize_image_input_models,
+    load_additional_models, parse_catalog, resolve_from_catalog, resolve_image_input_capability,
 };
 
 fn catalog() -> ImageInputCatalog {
@@ -134,4 +136,62 @@ fn unknown_model_fails_closed_as_unknown() {
         resolve_from_catalog(&catalog, "missing-model"),
         ImageInputCapability::Unknown
     );
+}
+
+#[test]
+fn loads_additional_models_from_data_directory_without_changing_embedded_catalog() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image_input_models.json");
+    fs::write(&path, r#"["new-vision-model", "gemini-next"]"#).unwrap();
+
+    let models = load_additional_models(&path).expect("valid additional models");
+    assert!(additional_models_support_image(&models, "new-vision-model"));
+    assert!(additional_models_support_image(&models, "models/gemini-next"));
+    assert!(!additional_models_support_image(&models, "unknown-model"));
+    assert_eq!(
+        resolve_from_catalog(&catalog(), "gpt-4o"),
+        ImageInputCapability::Supported
+    );
+
+    initialize_image_input_models(directory.path());
+    assert_eq!(
+        resolve_image_input_capability("new-vision-model"),
+        ImageInputCapability::Supported
+    );
+    assert_eq!(
+        resolve_image_input_capability("unknown-model"),
+        ImageInputCapability::Unknown
+    );
+}
+
+#[test]
+fn rejects_invalid_additional_models_without_affecting_embedded_catalog() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image_input_models.json");
+    fs::write(&path, r#"["valid", " "]"#).unwrap();
+    assert!(
+        load_additional_models(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("must not be blank")
+    );
+
+    fs::write(&path, r#"{"models":["new-model"]}"#).unwrap();
+    assert!(
+        load_additional_models(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid type")
+    );
+    assert_eq!(
+        resolve_from_catalog(&catalog(), "gpt-4o"),
+        ImageInputCapability::Supported
+    );
+}
+
+#[test]
+fn absent_additional_models_file_is_distinguishable_from_invalid_content() {
+    let directory = tempfile::tempdir().unwrap();
+    let error = load_additional_models(&directory.path().join("image_input_models.json")).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }

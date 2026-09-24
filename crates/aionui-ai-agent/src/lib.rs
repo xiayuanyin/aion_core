@@ -30,6 +30,7 @@ pub use agent_runtime::AgentRuntime;
 pub use agent_task::IMockAgent;
 pub use agent_task::{AgentInstance, IAgentTask};
 pub use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashCommandItem};
+pub use capability::image_input::initialize_image_input_models;
 pub use capability::skill_manager::{
     AcpSkillManager, SkillDefinition, SkillIndex, build_skills_index_text, build_system_instructions,
     build_system_instructions_with_skills_index, detect_skill_load_request, prepare_first_message,

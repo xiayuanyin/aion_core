@@ -94,6 +94,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
         None => {
             let mut env = bootstrap::init_environment(&cli, &merged_path)?;
+            aionui_ai_agent::initialize_image_input_models(&env.config.data_dir);
             let listener = commands::bind_http_listener(&mut env.config).await?;
             let database = bootstrap::init_data_layer(&env.config).await?;
             let services = AppServices::from_config(database, &env.config).await.map_err(|error| {

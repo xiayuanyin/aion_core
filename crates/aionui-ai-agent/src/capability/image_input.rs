@@ -1,15 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use aion_types::message::ImageInputCapability;
 use serde::Deserialize;
-use tracing::error;
+use tracing::{error, info, warn};
 
 const IMAGE_INPUT_CATALOG_SCHEMA_VERSION: u32 = 1;
 const IMAGE_INPUT_CATALOG_JSON: &str = include_str!("../../assets/model-capabilities/image_input_models.json");
 const BEDROCK_INFERENCE_PROFILE_PREFIXES: [&str; 6] = ["us.", "eu.", "apac.", "au.", "jp.", "global."];
 
 static IMAGE_INPUT_CATALOG: OnceLock<Option<ImageInputCatalog>> = OnceLock::new();
+static ADDITIONAL_IMAGE_INPUT_MODELS: OnceLock<HashSet<String>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct ImageInputCatalog {
@@ -26,9 +29,44 @@ struct ImageInputProvider {
 }
 
 pub(crate) fn resolve_image_input_capability(model: &str) -> ImageInputCapability {
+    if ADDITIONAL_IMAGE_INPUT_MODELS
+        .get()
+        .is_some_and(|models| additional_models_support_image(models, model))
+    {
+        return ImageInputCapability::Supported;
+    }
+
     embedded_catalog()
         .map(|catalog| resolve_from_catalog(catalog, model))
         .unwrap_or(ImageInputCapability::Unknown)
+}
+
+fn additional_models_support_image(models: &HashSet<String>, model: &str) -> bool {
+    models.contains(normalize_model_id(model))
+}
+
+pub fn initialize_image_input_models(data_dir: &Path) {
+    let path = data_dir.join("image_input_models.json");
+    ADDITIONAL_IMAGE_INPUT_MODELS.get_or_init(|| match load_additional_models(&path) {
+        Ok(models) => {
+            info!(count = models.len(), path = %path.display(), "Loaded additional image input models");
+            models
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+        Err(error) => {
+            warn!(path = %path.display(), error = %error, "Failed to load additional image input models; using embedded catalog");
+            HashSet::new()
+        }
+    });
+}
+
+fn load_additional_models(path: &Path) -> Result<HashSet<String>, std::io::Error> {
+    let json = fs::read_to_string(path)?;
+    let models: HashSet<String> = serde_json::from_str(&json).map_err(std::io::Error::other)?;
+    if models.iter().any(|model| model.trim().is_empty()) {
+        return Err(std::io::Error::other("model IDs must not be blank"));
+    }
+    Ok(models)
 }
 
 fn embedded_catalog() -> Option<&'static ImageInputCatalog> {

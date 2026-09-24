@@ -683,6 +683,21 @@ Before adding a new crate, confirm:
 
 ## Runtime Infrastructure
 
+### Image Input Model Catalog
+
+The server loads optional additional vision-capable model IDs from
+`{data_dir}/image_input_models.json` during startup. The file is a JSON array of
+exact model IDs, for example `["my-new-vision-model"]`. These IDs supplement
+the embedded provider catalog rather than replacing it. To enable a newly
+released model without rebuilding AionCore, edit this file under the directory
+selected by `--data-dir` (default `data`) and restart the server. An absent
+file uses only the embedded catalog; an invalid or unreadable file logs a
+warning and also falls back to the embedded catalog. Unknown models remain
+unknown rather than being treated as image-capable.
+The desktop main process fetches this list from Rails before launching the
+backend and atomically writes the file, retaining the last successful file
+when the Rails API is unavailable.
+
 ### Managed Node Runtime
 
 Builtin ACP adapters run through the managed Node runtime in
